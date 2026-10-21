@@ -6760,6 +6760,9 @@ body.no-clip-fx .sidebar { background: color-mix(in srgb, var(--md-sys-color-sur
 .search-albums-section {
   margin-bottom: 24px;
 }
+#artist-albums-container {
+  margin-top: 16px;
+}
 .search-albums-row {
   display: flex;
   gap: 16px;

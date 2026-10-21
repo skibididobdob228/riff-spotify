@@ -11,7 +11,10 @@ const TOKEN_EMBED_URL = 'https://open.spotify.com/embed/track/4iRg9tHDgmRPvv56IC
 const DEFAULT_HASHES = {
   searchTracks: 'b02683192a98dde7966b5e6655a79eeb62713eab703eda9902c932818dd52751',
   searchArtists: '7bf95d754fdbe32c8b161fbbe54d1ae50974900df4dce4c8f1afcbcad153224d',
-  queryArtistOverview: '9f8134ef565e78621f1e1793555bd6633c5ac144ae0f89604ed3ae3f80b3c8e6'
+  searchAlbums: '202cb3305e31e5a0767ba7925f28bd728cf8f8b0217e6da43909056071cd70e9',
+  queryArtistOverview: '9f8134ef565e78621f1e1793555bd6633c5ac144ae0f89604ed3ae3f80b3c8e6',
+  queryArtistDiscographyAll: '5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599',
+  getAlbum: '0b6ce3511e1b02e4a40fa95440f992acbe85080eb308af9194322d708fc1914f'
 };
 const SEARCH_VARS = { offset: 0, numberOfTopResults: 5, includeAudiobooks: false, includePreReleases: false, includeAuthors: false };
 
@@ -54,6 +57,22 @@ function mapTrack(t) {
     spotifyArtists: artists,
     explicit: !!(t.contentRating && t.contentRating.label === 'EXPLICIT'),
     plays: t.playcount ? Number(t.playcount) : 0
+  };
+}
+
+// Album/single/EP card in the shape Riff's album views use; ids are "sp_<spotify album id>"
+function mapRelease(r, fallbackArtist = '') {
+  if (!r || !String(r.uri || '').startsWith('spotify:album:')) return null;
+  const artists = ((r.artists && r.artists.items) || []).map((a) => a.profile && a.profile.name).filter(Boolean);
+  const year = (r.date && (r.date.year || String(r.date.isoString || '').slice(0, 4))) || '';
+  return {
+    id: `sp_${idOf(r.uri)}`,
+    title: r.name || '',
+    artist: artists.join(', ') || fallbackArtist,
+    year: year ? String(year) : '',
+    cover: pickImage(r.coverArt && r.coverArt.sources),
+    trackCount: (r.tracks && r.tracks.totalCount) || 0,
+    type: r.type || 'ALBUM'
   };
 }
 
@@ -159,7 +178,7 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
       try {
         const files = JSON.parse(Buffer.from(cdn[1].trim(), 'base64').toString('utf8'));
         for (const [name, url] of Object.entries(files)) {
-          if (/^build\/web-player\/xpui-routes-search\.[0-9a-f]+\.js$/.test(name)) urls.add(url);
+          if (/^build\/web-player\/xpui-routes-(search|artist)\.[0-9a-f]+\.js$/.test(name)) urls.add(url);
         }
       } catch (_) {}
     }
@@ -205,6 +224,59 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
     return items.map((x) => mapTrack(x && x.item && x.item.data)).filter(Boolean);
   }
 
+  async function searchAlbums(q, limit = 20) {
+    const d = await query('searchAlbums', { ...SEARCH_VARS, searchTerm: q, limit: Math.min(50, limit) });
+    const items = (d.searchV2 && d.searchV2.albumsV2 && d.searchV2.albumsV2.items) || [];
+    return items.map((x) => mapRelease(x && x.data)).filter(Boolean);
+  }
+
+  // Albums, singles, EPs and compilations, newest first
+  async function discography(artistId, artistName) {
+    const items = [];
+    for (let offset = 0; offset < 300; offset += 50) {
+      const d = await query('queryArtistDiscographyAll', { uri: `spotify:artist:${artistId}`, offset, limit: 50, order: 'DATE_DESC' });
+      const all = d.artistUnion && d.artistUnion.discography && d.artistUnion.discography.all;
+      const page = (all && all.items) || [];
+      items.push(...page);
+      if (!page.length || items.length >= ((all && all.totalCount) || 0)) break;
+    }
+    return items.map((x) => mapRelease(x.releases && x.releases.items && x.releases.items[0], artistName)).filter(Boolean);
+  }
+
+  // id: "sp_<album id>"; tracks follow Riff's album format plus `track`, a ready-to-play Spotify track
+  async function album(id) {
+    const albumId = String(id || '').replace(/^sp_/, '');
+    if (!/^[A-Za-z0-9]{22}$/.test(albumId)) return null;
+    let a = null;
+    const items = [];
+    for (let offset = 0; offset < 500; offset += 50) {
+      const d = await query('getAlbum', { uri: `spotify:album:${albumId}`, locale: '', offset, limit: 50 });
+      a = a || d.albumUnion;
+      const page = (d.albumUnion && d.albumUnion.tracksV2 && d.albumUnion.tracksV2.items) || [];
+      items.push(...page);
+      const total = (d.albumUnion && d.albumUnion.tracksV2 && d.albumUnion.tracksV2.totalCount) || 0;
+      if (!page.length || items.length >= total) break;
+    }
+    if (!a || !a.name) return null;
+    const info = mapRelease({ ...a, tracks: { totalCount: items.length } });
+    const tracks = items.map((x) => {
+      const t = x && x.track;
+      const track = mapTrack(t);
+      if (!track) return null;
+      track.thumbnail = track.thumbnail || info.cover;
+      track.album = track.album || info.title;
+      return {
+        no: t.trackNumber || 1,
+        disc: t.discNumber || 1,
+        title: track.title,
+        artist: track.artist,
+        durationMs: (t.duration && t.duration.totalMilliseconds) || 0,
+        track
+      };
+    }).filter(Boolean);
+    return { album: info, tracks };
+  }
+
   async function artist({ id, name }) {
     if (!id && name) {
       const d = await query('searchArtists', { ...SEARCH_VARS, searchTerm: name, limit: 5 });
@@ -215,9 +287,15 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
       id = idOf(hit.uri);
     }
     if (!/^[A-Za-z0-9]{22}$/.test(String(id || ''))) return null;
-    const d = await query('queryArtistOverview', { uri: `spotify:artist:${id}`, locale: '', includePrerelease: false });
+    const [d, releases] = await Promise.all([
+      query('queryArtistOverview', { uri: `spotify:artist:${id}`, locale: '', includePrerelease: false }),
+      discography(id, name).catch((e) => { log('warn', `discography failed: ${e.message}`); return null; })
+    ]);
     const a = d.artistUnion;
     if (!a || !a.profile) return null;
+    // The overview carries the first albums and singles, enough when the full discography call fails
+    const overviewReleases = ['albums', 'singles'].flatMap((k) => ((a.discography && a.discography[k] && a.discography[k].items) || [])
+      .map((x) => mapRelease(x.releases && x.releases.items && x.releases.items[0], a.profile.name)));
     const topTracks = (a.discography && a.discography.topTracks && a.discography.topTracks.items) || [];
     return {
       id,
@@ -228,7 +306,8 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
       header: pickImage(a.headerImage && a.headerImage.data && a.headerImage.data.sources),
       monthlyListeners: (a.stats && a.stats.monthlyListeners) || 0,
       followers: (a.stats && a.stats.followers) || 0,
-      tracks: topTracks.map((x) => mapTrack(x.track)).filter(Boolean)
+      tracks: topTracks.map((x) => mapTrack(x.track)).filter(Boolean),
+      releases: (releases || overviewReleases).filter(Boolean).map((r) => ({ ...r, artist: r.artist || a.profile.name }))
     };
   }
 
@@ -286,7 +365,7 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
     return p;
   }
 
-  return { idFromUrl, search, artist, resolveAudio, knownMatch };
+  return { idFromUrl, search, searchAlbums, album, artist, resolveAudio, knownMatch };
 };
 
 module.exports.matchScore = matchScore;

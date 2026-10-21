@@ -5619,6 +5619,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function resolveAlbumTrack(album, t) {
     if (!album || !t) return null;
+    if (t.track) return t.track;
     const albumId = album.id || '';
     const trackNo = t.no != null ? t.no : 1;
     const cacheKey = `${albumId}:${trackNo}`;
@@ -5813,13 +5814,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       album._tracks = tracks;
+      rememberSpotifyArtists(tracks.map((t) => t.track));
 
       if (listEl) {
         listEl.innerHTML = '';
         const currentCanonicalId = state.currentTrack ? getTrackCanonicalId(state.currentTrack) : '';
         tracks.forEach((t, idx) => {
           const trackItem = {
-            id: `${album.id}_${t.disc || 1}_${t.no || (idx + 1)}`,
+            ...(t.track || {}),
+            id: t.track ? t.track.id : `${album.id}_${t.disc || 1}_${t.no || (idx + 1)}`,
             title: t.title,
             artist: t.artist || albumArtist,
             albumArtist: albumArtist,
@@ -5892,6 +5895,47 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   window.bindHorizontalWheel = bindHorizontalWheel;
 
+  function renderAlbumShelf(container, heading, albums, subOf) {
+    const sub = subOf || ((album) => (album.year ? `${album.artist} · ${album.year}` : (album.artist || '')));
+    const section = document.createElement('div');
+    section.className = 'search-albums-section';
+    section.innerHTML = `
+      <div class="section-sub-header">
+        <h3>${escapeHtml(heading)}</h3>
+      </div>
+      <div class="search-albums-row">
+        ${albums.map(album => `
+          <div class="search-album-card" role="button" tabindex="0">
+            <img class="search-album-cover" src="${escapeHtml(album.cover || '')}" alt="${escapeHtml(album.title)}" loading="lazy" />
+            <div class="search-album-info">
+              <span class="search-album-title" title="${escapeHtml(album.title)}">${escapeHtml(album.title)}</span>
+              <span class="search-album-sub" title="${escapeHtml(sub(album))}">${escapeHtml(sub(album))}</span>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+    container.appendChild(section);
+
+    const row = section.querySelector('.search-albums-row');
+    if (row) {
+      bindHorizontalWheel(row);
+      requestAnimationFrame(() => updateRowFade(row));
+    }
+
+    section.querySelectorAll('.search-album-card').forEach((card, idx) => {
+      const album = albums[idx];
+      if (!album) return;
+      card.addEventListener('click', () => openAlbum(album));
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          openAlbum(album);
+        }
+      });
+    });
+  }
+
   async function fetchAlbumsForSearch(query, token) {
     let container = document.getElementById('search-albums-container');
     if (!container) {
@@ -5905,7 +5949,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!container) return;
 
     try {
-      const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/albums/search?q=${encodeURIComponent(query)}`);
+      const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/albums/search?q=${encodeURIComponent(query)}&platform=${state.platform}`);
       const data = await res.json();
       if (state.searchToken !== token) return;
       if (!data || !data.success || !Array.isArray(data.albums) || data.albums.length === 0) {
@@ -5913,47 +5957,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
       }
 
-      const albums = data.albums;
-      container.innerHTML = `
-        <div class="search-albums-section">
-          <div class="section-sub-header">
-            <h3>Albums</h3>
-          </div>
-          <div class="search-albums-row">
-            ${albums.map(album => {
-              const sub = album.year ? `${escapeHtml(album.artist)} · ${escapeHtml(album.year)}` : escapeHtml(album.artist || '');
-              return `
-                <div class="search-album-card" role="button" tabindex="0">
-                  <img class="search-album-cover" src="${escapeHtml(album.cover || '')}" alt="${escapeHtml(album.title)}" loading="lazy" />
-                  <div class="search-album-info">
-                    <span class="search-album-title" title="${escapeHtml(album.title)}">${escapeHtml(album.title)}</span>
-                    <span class="search-album-sub" title="${sub}">${sub}</span>
-                  </div>
-                </div>
-              `;
-            }).join('')}
-          </div>
-        </div>
-      `;
-
-      const row = container.querySelector('.search-albums-row');
-      if (row) {
-        bindHorizontalWheel(row);
-        requestAnimationFrame(() => updateRowFade(row));
-      }
-
-      const cards = container.querySelectorAll('.search-album-card');
-      cards.forEach((card, idx) => {
-        const album = albums[idx];
-        if (!album) return;
-        card.addEventListener('click', () => openAlbum(album));
-        card.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            openAlbum(album);
-          }
-        });
-      });
+      container.innerHTML = '';
+      renderAlbumShelf(container, 'Albums', data.albums);
     } catch (e) {
       if (state.searchToken === token && container) {
         container.innerHTML = '';
@@ -6412,6 +6417,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     requestAnimationFrame(() => {
       if (el.artistTracksList) renderTracks(el.artistTracksList, a.tracks, 'artist');
     });
+
+    const albumsContainer = document.getElementById('artist-albums-container');
+    if (albumsContainer) {
+      albumsContainer.innerHTML = '';
+      const releases = a.releases || [];
+      const yearAndCount = (r) => [r.year, r.trackCount ? `${r.trackCount} track${r.trackCount === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
+      const albums = releases.filter((r) => r.type === 'ALBUM' || r.type === 'COMPILATION');
+      const singles = releases.filter((r) => r.type === 'SINGLE' || r.type === 'EP');
+      if (albums.length) renderAlbumShelf(albumsContainer, 'Albums', albums, yearAndCount);
+      if (singles.length) renderAlbumShelf(albumsContainer, 'Singles and EPs', singles, yearAndCount);
+    }
     return true;
   }
 
@@ -6443,6 +6459,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (el.artistHeroBackdrop) el.artistHeroBackdrop.style.backgroundImage = '';
     if (el.artistTracksList) el.artistTracksList.innerHTML = '<div class="empty-hint">Fetching official releases...</div>';
     if (el.artistListeners) el.artistListeners.classList.add('hidden');
+    const artistAlbums = document.getElementById('artist-albums-container');
+    if (artistAlbums) artistAlbums.innerHTML = '';
 
     const spotifyArtist = findSpotifyArtist(artistName);
     if (spotifyArtist && await renderSpotifyArtist(spotifyArtist, heroCard)) return;

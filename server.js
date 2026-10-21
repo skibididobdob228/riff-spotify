@@ -3721,6 +3721,18 @@ function fetchItunesJson(url) {
 async function handleAlbumSearch(req, res, parsedUrl) {
   const q = (parsedUrl.query.q || '').trim();
 
+  if (q && parsedUrl.query.platform === 'spotify') {
+    try {
+      const albums = await spotifyEngine.searchAlbums(q, 20);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: true, albums }));
+    } catch (err) {
+      try { logger.log('error', `spotify album search failed: ${err.message}`); } catch (_) {}
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, error: 'Album service unavailable' }));
+    }
+  }
+
   if (!q) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ success: true, albums: [] }));
@@ -3775,6 +3787,22 @@ async function handleAlbumSearch(req, res, parsedUrl) {
 
 async function handleAlbumTracks(req, res, parsedUrl) {
   const id = (parsedUrl.query.id || '').trim();
+
+  if (/^sp_[A-Za-z0-9]{22}$/.test(id)) {
+    try {
+      const data = await spotifyEngine.album(id);
+      if (!data) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ success: false, error: 'Album not found' }));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: true, ...data }));
+    } catch (err) {
+      try { logger.log('error', `spotify album failed: ${err.message}`); } catch (_) {}
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, error: 'Album service unavailable' }));
+    }
+  }
   if (!/^\d+$/.test(id)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ success: false, error: 'Invalid album id' }));
