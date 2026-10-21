@@ -97,6 +97,10 @@
           </svg>
           <span>SoundCloud</span>
         </button>
+        <button class="platform-btn" data-platform="spotify" id="platform-sp" title="Spotify">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm4.6 14.4a.62.62 0 0 1-.86.2c-2.35-1.43-5.3-1.76-8.79-.96a.62.62 0 1 1-.28-1.21c3.81-.87 7.08-.5 9.72 1.11.3.18.39.56.21.86zm1.22-2.72a.78.78 0 0 1-1.07.26c-2.69-1.65-6.79-2.13-9.97-1.17a.78.78 0 0 1-.45-1.49c3.63-1.1 8.15-.57 11.24 1.33.36.22.48.7.25 1.07zm.1-2.83C14.7 8.94 9.37 8.76 6.3 9.7a.94.94 0 1 1-.54-1.8c3.53-1.07 9.4-.86 13.1 1.33a.94.94 0 0 1-.96 1.62z"/></svg>
+          <span>Spotify</span>
+        </button>
       </div>
     </div>
   </div>
@@ -412,6 +416,7 @@
                 <span>Verified artist</span>
               </div>
               <h1 class="artist-title" id="artist-profile-name">Artist</h1>
+              <p class="artist-listeners hidden" id="artist-listeners"></p>
               <p class="artist-bio-snippet hidden" id="artist-profile-bio"></p>
             </div>
           </div>
@@ -578,6 +583,7 @@
                 <option value="youtube" selected>YouTube</option>
                 <option value="ytmusic">YouTube Music</option>
                 <option value="soundcloud">SoundCloud</option>
+                <option value="spotify">Spotify</option>
               </select>
               <div class="m3-dropdown" id="engine-api-dropdown">
                 <button class="m3-dropdown-trigger" id="engine-api-trigger" type="button">
@@ -588,6 +594,7 @@
                   <button class="m3-dropdown-option selected" data-value="youtube" type="button">YouTube</button>
                   <button class="m3-dropdown-option" data-value="ytmusic" type="button">YouTube Music</button>
                   <button class="m3-dropdown-option" data-value="soundcloud" type="button">SoundCloud</button>
+                  <button class="m3-dropdown-option" data-value="spotify" type="button">Spotify</button>
                 </div>
               </div>
             </div>
@@ -596,7 +603,7 @@
               <div class="setting-item-top" style="align-items: center;">
                 <div style="display: flex; flex-direction: column; gap: 2px;">
                   <span class="setting-name">Compact engine buttons</span>
-                  <span style="font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline);">Show only icons for YouTube, YouTube Music, and SoundCloud in the top bar</span>
+                  <span style="font-size: calc(12px * var(--font-scale, 1)); color: var(--md-sys-color-outline);">Show only icons for YouTube, YouTube Music, SoundCloud and Spotify in the top bar</span>
                 </div>
                 <button class="effect-switch-btn" id="btn-compact-engine-btns"><span class="thumb"></span></button>
               </div>

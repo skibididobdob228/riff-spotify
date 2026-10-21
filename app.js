@@ -1404,6 +1404,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                           platformYt: document.getElementById('platform-yt'),
                           platformYtm: document.getElementById('platform-ytm'),
                           platformSc: document.getElementById('platform-sc'),
+                          platformSp: document.getElementById('platform-sp'),
 
                           navActiveIndicator: document.getElementById('nav-active-indicator'),
                           navDiscover: document.getElementById('nav-discover'),
@@ -1455,6 +1456,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                           artistAvatarFallback: document.getElementById('artist-avatar-fallback'),
                           artistVerifiedBadge: document.getElementById('artist-verified-badge'),
                           artistProfileName: document.getElementById('artist-profile-name'),
+                          artistListeners: document.getElementById('artist-listeners'),
                           artistProfileBio: document.getElementById('artist-profile-bio'),
                           btnPlayArtistTracks: document.getElementById('btn-play-artist-tracks'),
                           artistTracksCount: document.getElementById('artist-tracks-count'),
@@ -6001,10 +6003,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (!data.success || !data.tracks) {
         if (state.platform === 'ytmusic') showToast('YouTube Music is unavailable');
+        if (state.platform === 'spotify') showToast('Spotify search is unavailable');
         throw new Error(data.error || 'Failed to load search results');
       }
 
       state.searchResults = data.tracks;
+      rememberSpotifyArtists(data.tracks);
 
       requestAnimationFrame(() => {
         if (el.searchTracksList) renderTracks(el.searchTracksList, data.tracks, 'search');
@@ -6333,6 +6337,84 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   const artistBioCache = new Map();
 
+  // Spotify artist ids seen on Spotify tracks, by lowercase name
+  const spotifyArtistIds = new Map();
+  function rememberSpotifyArtists(tracks) {
+    (tracks || []).forEach((t) => ((t && t.spotifyArtists) || []).forEach((a) => {
+      if (a && a.id && a.name) spotifyArtistIds.set(a.name.toLowerCase(), a.id);
+    }));
+  }
+
+  function findSpotifyArtist(artistName) {
+    rememberSpotifyArtists([state.currentTrack]);
+    const full = String(artistName || '').trim();
+    const first = full.split(',')[0].trim();
+    const id = spotifyArtistIds.get(full.toLowerCase()) || spotifyArtistIds.get(first.toLowerCase());
+    if (id) return { id };
+    return state.platform === 'spotify' && first ? { name: first } : null;
+  }
+
+  // Fills the artist page from Spotify; false means fall back to the YouTube profile
+  async function renderSpotifyArtist(lookup, heroCard) {
+    let data;
+    try {
+      const q = lookup.id ? `id=${encodeURIComponent(lookup.id)}` : `name=${encodeURIComponent(lookup.name)}`;
+      const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/spotify-artist?${q}`);
+      data = await res.json();
+    } catch (e) {
+      return false;
+    }
+    if (!data || !data.success || !data.artist || state.currentView !== 'artist') return false;
+    const a = data.artist;
+    rememberSpotifyArtists(a.tracks);
+    state.currentArtistData = a;
+
+    if (el.artistProfileName) el.artistProfileName.textContent = a.name;
+    if (el.artistListeners) {
+      el.artistListeners.textContent = a.monthlyListeners ? `${a.monthlyListeners.toLocaleString('en-US')} monthly listeners` : '';
+      el.artistListeners.classList.toggle('hidden', !a.monthlyListeners);
+    }
+    // Spotify bios carry links; DOMParser documents are inert, so this only extracts text
+    const bio = a.bio ? (new DOMParser().parseFromString(a.bio, 'text/html').body.textContent || '').trim() : '';
+    if (el.artistProfileBio) {
+      el.artistProfileBio.textContent = bio;
+      el.artistProfileBio.classList.toggle('hidden', !bio);
+      if (bio) requestAnimationFrame(() => { el.artistProfileBio.style.opacity = '1'; });
+    }
+    if (el.artistVerifiedBadge) el.artistVerifiedBadge.classList.toggle('hidden', !a.isVerified);
+
+    const wrap = document.getElementById('artist-avatar-wrap');
+    if (a.avatar) {
+      if (el.artistAvatarImg) {
+        el.artistAvatarImg.src = a.avatar;
+        el.artistAvatarImg.style.display = 'block';
+      }
+      if (el.artistAvatarFallback) el.artistAvatarFallback.style.display = 'none';
+    } else if (wrap) {
+      wrap.classList.remove('loading');
+    }
+    const backdrop = a.header || a.avatar;
+    if (el.artistHeroBackdrop) el.artistHeroBackdrop.style.backgroundImage = backdrop ? `url("${backdrop}")` : '';
+    const setAccent = (c) => {
+      if (!heroCard) return;
+      heroCard.style.setProperty('--artist-accent-color', c);
+      document.documentElement.style.setProperty('--artist-accent-color', c);
+    };
+    if (a.avatar) {
+      getCoverDominantColors(a.avatar).then(([domColor]) => {
+        if (state.currentView === 'artist') setAccent(domColor || 'var(--md-sys-color-primary-container)');
+      }).catch(() => setAccent('var(--md-sys-color-primary-container)'));
+    } else {
+      setAccent('var(--md-sys-color-primary-container)');
+    }
+
+    if (el.artistTracksCount) el.artistTracksCount.textContent = `${a.tracks.length} tracks`;
+    requestAnimationFrame(() => {
+      if (el.artistTracksList) renderTracks(el.artistTracksList, a.tracks, 'artist');
+    });
+    return true;
+  }
+
   async function openArtistProfile(artistName) {
     if (!artistName || !artistName.trim()) return;
     const cleanName = artistName.replace(/ - Topic|VEVO|Official|Records/gi, '').trim();
@@ -6360,6 +6442,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (el.artistVerifiedBadge) el.artistVerifiedBadge.classList.add('hidden');
     if (el.artistHeroBackdrop) el.artistHeroBackdrop.style.backgroundImage = '';
     if (el.artistTracksList) el.artistTracksList.innerHTML = '<div class="empty-hint">Fetching official releases...</div>';
+    if (el.artistListeners) el.artistListeners.classList.add('hidden');
+
+    const spotifyArtist = findSpotifyArtist(artistName);
+    if (spotifyArtist && await renderSpotifyArtist(spotifyArtist, heroCard)) return;
 
     const bioCacheKey = cleanName.toLowerCase();
     let bioFromCache = false;
@@ -7806,18 +7892,19 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
   function setPlatform(platform, triggerSearch = true) {
-    if (!['youtube', 'ytmusic', 'soundcloud'].includes(platform)) platform = 'youtube';
+    if (!['youtube', 'ytmusic', 'soundcloud', 'spotify'].includes(platform)) platform = 'youtube';
     state.platform = platform;
     localStorage.setItem('riff_platform', platform);
 
     if (el.platformYt) el.platformYt.classList.toggle('active', platform === 'youtube');
     if (el.platformYtm) el.platformYtm.classList.toggle('active', platform === 'ytmusic');
     if (el.platformSc) el.platformSc.classList.toggle('active', platform === 'soundcloud');
+    if (el.platformSp) el.platformSp.classList.toggle('active', platform === 'spotify');
 
     const select = document.getElementById('select-engine-api');
     if (select) select.value = platform;
     const label = document.getElementById('engine-api-label');
-    const nameMap = { youtube: 'YouTube', ytmusic: 'YouTube Music', soundcloud: 'SoundCloud' };
+    const nameMap = { youtube: 'YouTube', ytmusic: 'YouTube Music', soundcloud: 'SoundCloud', spotify: 'Spotify' };
     if (label) label.textContent = nameMap[platform] || 'YouTube';
     const menu = document.getElementById('engine-api-menu');
     if (menu) {
@@ -7837,6 +7924,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (el.platformYt) el.platformYt.addEventListener('click', () => setPlatform('youtube'));
   if (el.platformYtm) el.platformYtm.addEventListener('click', () => setPlatform('ytmusic'));
   if (el.platformSc) el.platformSc.addEventListener('click', () => setPlatform('soundcloud'));
+  if (el.platformSp) el.platformSp.addEventListener('click', () => setPlatform('spotify'));
 
   const engineApiDropdown = document.getElementById('engine-api-dropdown');
   const engineApiTrigger = document.getElementById('engine-api-trigger');
@@ -7870,7 +7958,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       document.documentElement.style.setProperty('--engine-gap', '0px');
     } else {
       const isCompact = document.body.classList.contains('compact-engine-btns');
-      const w = isCompact ? 124 : (container.offsetWidth || 435);
+      const w = isCompact ? 164 : (container.offsetWidth || 435);
       if (w > 0) {
         document.documentElement.style.setProperty('--engine-w', `${w}px`);
         document.documentElement.style.setProperty('--engine-gap', '16px');

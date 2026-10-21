@@ -10,8 +10,9 @@ const dns = require('dns');
 const net = require('net');
 
 const PORT = 38472;
-const { CACHE_DIR, CUSTOM_LYRICS_DIR, LYRICS_DIR, THUMBNAILS_DIR, METADATA_PATH, LIBRARY_DIR, LIBRARY_PATH, ytDlpCommand, resolveDownloadDir, resolveBinary } = require('./platform');
+const { DATA_DIR, CACHE_DIR, CUSTOM_LYRICS_DIR, LYRICS_DIR, THUMBNAILS_DIR, METADATA_PATH, LIBRARY_DIR, LIBRARY_PATH, ytDlpCommand, resolveDownloadDir, resolveBinary } = require('./platform');
 const logger = require('./logger');
+const createSpotifyEngine = require('./spotify-engine');
 const { getSystemAudioOutputInfo } = require('./audio-output');
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -1239,6 +1240,13 @@ async function downloadTrackToDisk(trackUrl, trackId, platform, meta = {}) {
 }
 
 async function prefetchTrack(trackUrl, trackId, platform) {
+  const spId = spotifyEngine.idFromUrl(trackUrl);
+  if (spId) {
+    const videoId = spotifyEngine.knownMatch(spId);
+    if (!videoId) return;
+    trackUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    platform = 'youtube';
+  }
   let cleanId = cleanTrackId(trackId);
   if (!cleanId && trackUrl && trackUrl.includes('v=')) {
     cleanId = cleanTrackId(trackUrl.split('v=')[1].split('&')[0]);
@@ -1388,6 +1396,16 @@ function parseYtmSongs(json) {
   return out;
 }
 
+const spotifyEngine = createSpotifyEngine({ ytmSearchRequest, parseYtmSongs, directYoutubeSearch, logger, dataDir: DATA_DIR });
+
+// Spotify tracks play the matching YouTube song; returns the URL to hand to yt-dlp, or '' when nothing matched
+async function resolveSpotifyTrackUrl(trackUrl, meta = {}) {
+  const spId = spotifyEngine.idFromUrl(trackUrl);
+  if (!spId) return trackUrl;
+  const videoId = await spotifyEngine.resolveAudio(spId, meta);
+  return videoId ? `https://www.youtube.com/watch?v=${videoId}` : '';
+}
+
 async function searchYtmTracks(query, limit = 16) {
   const cacheKey = `ytm_vibe:${limit}:${String(query || '').trim().toLowerCase()}`;
   if (searchCache.has(cacheKey)) {
@@ -1431,6 +1449,29 @@ async function handleSearch(req, res, query, platform = 'youtube', limit = 20) {
   if (searchCache.has(cacheKey)) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify(searchCache.get(cacheKey)));
+  }
+
+  if (platform === 'spotify') {
+    try {
+      const tracks = await spotifyEngine.search(query, limit);
+      const entries = await Promise.all(tracks.map(async (t) => ({ ...t, isCached: !!(await findCachedFile(t.id)) })));
+      const result = { success: true, tracks: entries };
+      if (entries.length) searchCache.set(cacheKey, result);
+      const first = entries[0];
+      if (first) {
+        setTimeout(() => {
+          spotifyEngine.resolveAudio(first.id.replace(/^sp_/, ''), first)
+            .then((videoId) => { if (videoId) prefetchTrack(`https://www.youtube.com/watch?v=${videoId}`, first.id, 'youtube'); })
+            .catch(() => {});
+        }, 60);
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(result));
+    } catch (err) {
+      try { logger.log('error', `spotify search failed: ${err.message}`); } catch (_) {}
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, tracks: [], error: 'Spotify search is unavailable' }));
+    }
   }
 
   if (platform === 'youtube') {
@@ -1669,6 +1710,10 @@ async function handleVibeRecommendations(req, res, payload) {
 }
 
 async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube', title = '', artist = '', duration = 0, thumbnail = '') {
+  if (spotifyEngine.idFromUrl(trackUrl)) {
+    trackUrl = await resolveSpotifyTrackUrl(trackUrl, { title, artist, duration });
+    if (trackUrl) platform = 'youtube';
+  }
   let cleanId = cleanTrackId(trackId);
   if (!cleanId && trackUrl && trackUrl.includes('v=')) {
     cleanId = cleanTrackId(trackUrl.split('v=')[1].split('&')[0]);
@@ -2212,7 +2257,7 @@ async function handleDownload(req, res, trackUrl, title, artist, format = 'mp3',
   const outPath = isRaw ? path.join(tmpDir, tempName) : path.join(downloadsDir, outFilename);
   const tempTemplate = isRaw ? path.join(tmpDir, tempName.replace(/\.wav$/, '.%(ext)s')) : path.join(downloadsDir, `${cleanArtist} - ${cleanTitle}.%(ext)s`);
 
-  let targetUrl = trackUrl;
+  let targetUrl = spotifyEngine.idFromUrl(trackUrl) ? await resolveSpotifyTrackUrl(trackUrl, { title, artist }) : trackUrl;
   if (!isSafeMediaUrl(targetUrl) || targetUrl.includes('deezer.com')) {
     targetUrl = `ytsearch1:${cleanArtist} ${cleanTitle} official audio`;
   }
@@ -2638,6 +2683,7 @@ const TOKEN_PROTECTED_ROUTES = new Set([
   '/api/lyrics',
   '/api/download',
   '/api/spotify-import',
+  '/api/spotify-artist',
   '/api/prefetch',
   '/api/check-cache',
   '/api/stream-info',
@@ -4064,6 +4110,20 @@ const server = http.createServer(async (req, res) => {
       handleVibeRecommendations(req, res, payload);
     });
     return;
+  }
+
+  if (parsedUrl.pathname === '/api/spotify-artist') {
+    try {
+      const artist = await spotifyEngine.artist({ id: parsedUrl.query.id || '', name: parsedUrl.query.name || '' });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (!artist) return res.end(JSON.stringify({ success: false, error: 'Artist not found' }));
+      artist.tracks = await Promise.all(artist.tracks.map(async (t) => ({ ...t, isCached: !!(await findCachedFile(t.id)) })));
+      return res.end(JSON.stringify({ success: true, artist }));
+    } catch (err) {
+      try { logger.log('error', `spotify artist failed: ${err.message}`); } catch (_) {}
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, error: 'Spotify is unavailable' }));
+    }
   }
 
   if (parsedUrl.pathname === '/api/artist') {

@@ -7,11 +7,11 @@
 @property --md-sys-color-surface-container { syntax: '<color>'; inherits: true; initial-value: #1E1F22; }
 @property --banner-fade-end { syntax: '<percentage>'; inherits: true; initial-value: 38%; }
 @property --banner-fade-base { syntax: '<percentage>'; inherits: true; initial-value: 38%; }
-@property --engine-w { syntax: '<length>'; inherits: true; initial-value: 435px; }
+@property --engine-w { syntax: '<length>'; inherits: true; initial-value: 540px; }
 @property --engine-gap { syntax: '<length>'; inherits: true; initial-value: 16px; }
 
 :root {
-  --engine-w: 435px;
+  --engine-w: 540px;
   --engine-gap: 16px;
   --font-scale: 1.1875;
   --banner-blur: 3px;
@@ -411,7 +411,7 @@ body.is-playing .shape-triangle {
   z-index: 3;
   display: flex;
   align-items: center;
-  max-width: 460px;
+  max-width: 580px;
   opacity: 1;
   transform: scale(1);
   overflow: hidden;
@@ -525,7 +525,7 @@ body.is-playing .shape-triangle {
 }
 
 body.compact-engine-btns {
-  --engine-w: 124px;
+  --engine-w: 164px;
 }
 body.compact-engine-btns .platform-btn {
   padding: 8px 10px !important;
@@ -1651,6 +1651,15 @@ body.perf .my-wave-ambient-light {
   text-transform: none;
   opacity: 0;
   transition: opacity var(--transition-short, 0.2s) ease;
+}
+.artist-listeners {
+  margin: 0;
+  font-size: calc(14px * var(--font-scale, 1));
+  font-weight: 500;
+  color: var(--md-sys-color-on-surface-variant);
+}
+.artist-listeners.hidden {
+  display: none;
 }
 .artist-bio-snippet.hidden {
   display: none !important;
