@@ -149,8 +149,17 @@ function findInPath(name, env = process.env, platform = process.platform) {
 
 const binaryCache = {};
 
+// Android build: yt-dlp runs on youtubedl-android's Python and QuickJS; the app passes their paths here
+const ANDROID_YTDLP = process.env.RIFF_YTDLP_PYTHON
+  ? { python: process.env.RIFF_YTDLP_PYTHON, script: process.env.RIFF_YTDLP_SCRIPT, quickjs: process.env.RIFF_YTDLP_QUICKJS }
+  : null;
+
 function resolveBinary(name) {
   if (name in binaryCache) return binaryCache[name];
+  if (ANDROID_YTDLP && name === 'yt-dlp') {
+    binaryCache[name] = fs.existsSync(ANDROID_YTDLP.script) ? ANDROID_YTDLP.script : null;
+    return binaryCache[name];
+  }
   const exe = IS_WIN ? `${name}.exe` : name;
   const envKey = `RIFF_${name.replace(/[^a-z0-9]/gi, '').toUpperCase()}`;
   const candidates = [
@@ -174,6 +183,10 @@ function ytDlpCommand(args) {
     throw new Error('yt-dlp not found. Put yt-dlp and ffmpeg into the bin folder next to the app, or add them to PATH.');
   }
   const ffmpeg = resolveBinary('ffmpeg');
+  if (ANDROID_YTDLP) {
+    const extra = ['--js-runtimes', `quickjs:${ANDROID_YTDLP.quickjs}`].concat(ffmpeg ? ['--ffmpeg-location', ffmpeg] : []);
+    return { bin: ANDROID_YTDLP.python, args: [bin].concat(extra, args) };
+  }
   const extra = ffmpeg && !findInPath('ffmpeg') ? ['--ffmpeg-location', path.dirname(ffmpeg)] : [];
   return { bin, args: extra.concat(args) };
 }

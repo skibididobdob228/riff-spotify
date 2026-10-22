@@ -6362,12 +6362,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Fills the artist page from Spotify; false means fall back to the YouTube profile
   async function renderSpotifyArtist(lookup, heroCard) {
     let data;
-    try {
-      const q = lookup.id ? `id=${encodeURIComponent(lookup.id)}` : `name=${encodeURIComponent(lookup.name)}`;
-      const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/spotify-artist?${q}`);
-      data = await res.json();
-    } catch (e) {
-      return false;
+    const q = lookup.id ? `id=${encodeURIComponent(lookup.id)}` : `name=${encodeURIComponent(lookup.name)}`;
+    // One retry: the first Spotify call after start also fetches a token and may be slow to come back
+    for (let attempt = 0; attempt < 2 && !(data && data.success); attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 800));
+      try {
+        const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/spotify-artist?${q}`);
+        data = await res.json();
+      } catch (e) {
+        data = null;
+      }
     }
     if (!data || !data.success || !data.artist || state.currentView !== 'artist') return false;
     const a = data.artist;
@@ -6433,7 +6437,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function openArtistProfile(artistName) {
     if (!artistName || !artistName.trim()) return;
-    const cleanName = artistName.replace(/ - Topic|VEVO|Official|Records/gi, '').trim();
+    let cleanName = artistName.replace(/ - Topic|VEVO|Official|Records/gi, '').trim();
 
     state.previousView = state.currentView;
     switchView('artist');
@@ -6463,7 +6467,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (artistAlbums) artistAlbums.innerHTML = '';
 
     const spotifyArtist = findSpotifyArtist(artistName);
-    if (spotifyArtist && await renderSpotifyArtist(spotifyArtist, heroCard)) return;
+    if (spotifyArtist) {
+      if (await renderSpotifyArtist(spotifyArtist, heroCard)) return;
+      // Spotify tracks list every artist ("A, B, C"); the fallback profile is for the main one
+      cleanName = cleanName.split(',')[0].trim();
+      if (el.artistProfileName) el.artistProfileName.textContent = cleanName;
+    }
 
     const bioCacheKey = cleanName.toLowerCase();
     let bioFromCache = false;
@@ -10383,7 +10392,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (window.electronAPI && window.electronAPI.onWelcomeResult) window.electronAPI.onWelcomeResult((d) => applyWelcomeResult(d));
 
   function checkCompactLayout() {
-    const isMini = window.innerWidth <= 520;
+    // A phone is narrow too, but wants the full app rather than the desktop mini player
+    const isMini = window.innerWidth <= 520 && !(window.electronAPI && window.electronAPI.isAndroid);
     document.body.classList.toggle('mini', isMini);
   }
   window.addEventListener('resize', checkCompactLayout);
