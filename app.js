@@ -9928,7 +9928,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   let appCssCache = null;
 
   function applyCustomStyles() {
-    document.querySelectorAll('style[data-riff-custom]').forEach((n) => n.remove());
+    // Plugin styles belong to running plugins; stopPlugin removes them
+    document.querySelectorAll('style[data-riff-custom]:not([data-riff-custom="plugin"])').forEach((n) => n.remove());
     customThemes.filter((t) => t.enabled).forEach((t) => {
       const s = document.createElement('style');
       s.dataset.riffCustom = 'theme';
