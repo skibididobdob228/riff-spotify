@@ -1,0 +1,9 @@
+.gradle/
+build/
+app/build/
+app/.cxx/
+local.properties
+app/src/main/assets/riff.zip
+*.apk
+release.keystore
+keystore.properties

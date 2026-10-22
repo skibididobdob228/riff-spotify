@@ -1,0 +1,93 @@
+/* Riff on a phone. Riff's own narrow layout (bottom navigation) does most of the work;
+   this hides desktop window chrome and turns the right panel into a full-screen "now playing" sheet. */
+html.riff-android .titlebar-controls { display: none !important; }
+
+/* Desktop-only settings: Discord, window/tray behaviour, keyboard, tool installs and folder pickers
+   (yt-dlp and ffmpeg ship inside the app; downloads go to the app folder and are copied to Music/Riff) */
+html.riff-android .setting-item:has(#btn-discord-rpc),
+html.riff-android .setting-item:has(#btn-install-tools),
+html.riff-android .setting-item:has(#btn-change-music-folder),
+html.riff-android .setting-item:has(#btn-reset-download-folder),
+html.riff-android .setting-item:has(#btn-tray-on-close),
+html.riff-android #setting-win-media-keys,
+html.riff-android .setting-item:has(#btn-multi-instance),
+html.riff-android .setting-item:has(#btn-open-shortcuts) { display: none !important; }
+
+@media (max-width: 600px) {
+  html.riff-android .titlebar { display: none !important; }
+  html.riff-android .panel-resize-edge { display: none !important; }
+
+  /* Search on its own row, engine buttons in a row under it */
+  html.riff-android .top-nav {
+    flex-wrap: wrap !important;
+    height: auto !important;
+    gap: 8px !important;
+    padding-top: 8px !important;
+  }
+  html.riff-android .search-box-wrapper {
+    position: static !important;
+    left: auto !important;
+    transform: none !important;
+    width: 100% !important;
+    max-width: none !important;
+    flex: 1 1 100% !important;
+  }
+  html.riff-android .platform-switch-container {
+    margin: 0 auto !important;
+    max-width: none !important;
+  }
+
+  /* Now playing: a full-screen sheet over everything, opened from the player (Riff hides it with .hidden) */
+  html.riff-android .right-panel:not(.hidden) {
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    height: 100% !important;
+    margin: 0 !important;
+    border-radius: 0 !important;
+    transform: none !important;
+    z-index: 400 !important;
+  }
+
+  /* Track rows: room for the title; favorite and "more" stay, the rest is in the "more" menu */
+  html.riff-android .track-row-info { flex: 1 1 auto !important; min-width: 0 !important; }
+  html.riff-android .track-row-actions .btn-row-art,
+  html.riff-android .track-row-actions .btn-row-add-playlist { display: none !important; }
+  html.riff-android .track-row-actions { opacity: 1 !important; }
+
+  /* Player bar in two rows: cover, title and controls; then the seek bar across the whole width.
+     Tapping it opens the now-playing sheet with lyrics, so the lyrics/EQ buttons can go. */
+  html.riff-android #playbar {
+    grid-template-columns: minmax(0, 1fr) auto !important;
+    grid-template-areas: "left controls" "scrub scrub" !important;
+    row-gap: 0 !important;
+    padding: 8px 12px 4px !important;
+    height: auto !important;
+  }
+  html.riff-android #playbar .playbar-left { grid-area: left; min-width: 0 !important; gap: 12px !important; }
+  html.riff-android #playbar .playback-controls { grid-area: controls; gap: 4px !important; }
+  html.riff-android #playbar .scrubber-bar-wrapper { grid-area: scrub; width: 100% !important; }
+  html.riff-android #playbar .playbar-right,
+  html.riff-android #playbar #btn-shuffle,
+  html.riff-android #playbar #btn-repeat { display: none !important; }
+  html.riff-android #playbar-artwork-wrapper { width: 48px !important; height: 48px !important; flex: 0 0 48px !important; }
+  html.riff-android #playbar .track-meta { flex: 1 1 auto !important; min-width: 0 !important; }
+  html.riff-android #playbar #btn-play-pause { width: 52px !important; height: 44px !important; }
+  /* While the now-playing sheet is open, it owns the screen down to the player bar */
+  html.riff-android body:has(#right-panel:not(.hidden)) .top-nav,
+  html.riff-android body:has(#right-panel:not(.hidden)) .sidebar { visibility: hidden !important; }
+
+  /* Artist page: photo above the name, a shorter biography */
+  html.riff-android .artist-card-body { flex-direction: column !important; align-items: flex-start !important; gap: 16px !important; }
+  html.riff-android .artist-avatar-wrap { width: 140px !important; height: 140px !important; }
+  html.riff-android .artist-bio-snippet {
+    display: -webkit-box !important;
+    -webkit-line-clamp: 5;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  /* Home: the hero titles ("My Wave", "Hot picks") sit left of their buttons instead of centered under them */
+  html.riff-android .home-pane-header { justify-content: flex-start !important; padding-left: 20px !important; }
+}
