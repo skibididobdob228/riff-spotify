@@ -42,7 +42,8 @@ function initUpdater(getWindow) {
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
 
-  const canInstall = process.platform === 'win32' || (process.platform === 'linux' && !!process.env.APPIMAGE);
+  // Modded build (Spotify engine): an official update would replace it, so only point to the release page
+  const canInstall = false;
   const send = (channel, payload) => {
     const win = getWindow();
     if (win && !win.isDestroyed()) win.webContents.send(channel, payload);

@@ -5,7 +5,7 @@ const os = require('os');
 const { pathToFileURL } = require('url');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
-const { LIBRARY_DIR, DATA_DIR, resolveBinary, tutorialDone, markTutorialDone, readStartupConfig, writeStartupConfig } = require('./platform');
+const { LIBRARY_DIR, DATA_DIR, PORTABLE_DIR, resolveBinary, tutorialDone, markTutorialDone, readStartupConfig, writeStartupConfig } = require('./platform');
 const { getLauncherInfo, installLauncher } = require('./launcher');
 const { getSystemAudioOutputInfo } = require('./audio-output');
 const { log, tail, LOG_DIR } = require('./logger');
@@ -43,6 +43,7 @@ if (enabledFeatures.length > 0) {
 }
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+if (PORTABLE_DIR) app.setPath('userData', path.join(PORTABLE_DIR, 'profile'));
 app.commandLine.appendSwitch('ignore-gpu-blocklist');
 app.commandLine.appendSwitch('enable-gpu-rasterization');
 app.commandLine.appendSwitch('enable-zero-copy');

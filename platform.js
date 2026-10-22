@@ -4,17 +4,22 @@ const path = require('path');
 
 const IS_WIN = process.platform === 'win32';
 
-const DEFAULT_DATA_DIR = IS_WIN
-  ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Riff')
-  : process.platform === 'darwin'
-  ? path.join(os.homedir(), 'Library', 'Application Support', 'Riff')
-  : path.join(os.homedir(), '.cache', 'devsize');
+// Portable build: a file named "portable" next to the executable keeps every byte of data in ./data beside it
+const PORTABLE_DIR = fs.existsSync(path.join(path.dirname(process.execPath), 'portable'))
+  ? path.join(path.dirname(process.execPath), 'data')
+  : null;
 
-const CONFIG_DIR = IS_WIN
+const DEFAULT_DATA_DIR = PORTABLE_DIR || (IS_WIN
   ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Riff')
   : process.platform === 'darwin'
   ? path.join(os.homedir(), 'Library', 'Application Support', 'Riff')
-  : path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'devsize');
+  : path.join(os.homedir(), '.cache', 'devsize'));
+
+const CONFIG_DIR = PORTABLE_DIR || (IS_WIN
+  ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Riff')
+  : process.platform === 'darwin'
+  ? path.join(os.homedir(), 'Library', 'Application Support', 'Riff')
+  : path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'devsize'));
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 
 function readConfig() {
@@ -179,7 +184,7 @@ function clearBinaryCache() {
 
 module.exports = {
   clearBinaryCache,
-  IS_WIN, DATA_DIR, DEFAULT_DATA_DIR, CONFIG_PATH, BIN_DIR, CACHE_DIR, CUSTOM_LYRICS_DIR, LYRICS_DIR, THUMBNAILS_DIR, METADATA_PATH,
+  IS_WIN, PORTABLE_DIR, DATA_DIR, DEFAULT_DATA_DIR, CONFIG_PATH, BIN_DIR, CACHE_DIR, CUSTOM_LYRICS_DIR, LYRICS_DIR, THUMBNAILS_DIR, METADATA_PATH,
   LIBRARY_DIR, LIBRARY_PATH, STARTUP_PATH,
   findInPath, resolveBinary, ytDlpCommand,
   tutorialDone, markTutorialDone,

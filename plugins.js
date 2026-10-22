@@ -4,6 +4,7 @@ const path = require('path');
 const { DATA_DIR } = require('./platform');
 
 const PLUGINS_DIR = path.join(DATA_DIR, 'plugins');
+const BUNDLED_DIR = path.join(__dirname, 'bundled-plugins');
 const STATE_PATH = path.join(PLUGINS_DIR, 'plugins.json');
 const MAX_BYTES = 1024 * 1024;
 const safeName = (n) => /^[\w.\- ]+\.js$/.test(String(n)) && !String(n).includes('..');
@@ -11,21 +12,45 @@ const safeName = (n) => /^[\w.\- ]+\.js$/.test(String(n)) && !String(n).includes
 const EXAMPLE = '/**\n * @name Hello plugin\n * @author Riff\n * @version 1.0.0\n * @description Shows a message when the track changes. Edit or delete this file.\n */\nconst off = Riff.on(\'trackchange\', (track) => Riff.toast(\'Now playing: \' + track.title));\nreturn { stop() { off(); } };\n';
 
 function ensureDir() {
-  if (fs.existsSync(PLUGINS_DIR)) return;
-  fs.mkdirSync(PLUGINS_DIR, { recursive: true });
-  try { fs.writeFileSync(path.join(PLUGINS_DIR, 'example-hello.js'), EXAMPLE); } catch (e) {}
+  if (!fs.existsSync(PLUGINS_DIR)) {
+    fs.mkdirSync(PLUGINS_DIR, { recursive: true });
+    try { fs.writeFileSync(path.join(PLUGINS_DIR, 'example-hello.js'), EXAMPLE); } catch (e) {}
+  }
+  installBundled();
+}
+
+function readStateFile() {
+  try {
+    const j = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+    return j && typeof j === 'object' ? j : {};
+  } catch (e) { return {}; }
 }
 
 function readState() {
-  try {
-    const j = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-    return j && typeof j.enabled === 'object' && j.enabled ? j.enabled : {};
-  } catch (e) { return {}; }
+  const j = readStateFile();
+  return typeof j.enabled === 'object' && j.enabled ? j.enabled : {};
 }
 
 function writeState(enabled) {
   ensureDir();
-  fs.writeFileSync(STATE_PATH, JSON.stringify({ enabled }));
+  fs.writeFileSync(STATE_PATH, JSON.stringify({ ...readStateFile(), enabled }));
+}
+
+// Plugins shipped with this build are copied in (and turned on) once; deleting one later keeps it deleted
+function installBundled() {
+  let names = [];
+  try { names = fs.readdirSync(BUNDLED_DIR).filter(safeName); } catch (e) { return; }
+  const state = readStateFile();
+  const seen = Array.isArray(state.bundled) ? state.bundled : [];
+  const fresh = names.filter((n) => !seen.includes(n));
+  if (!fresh.length) return;
+  const enabled = typeof state.enabled === 'object' && state.enabled ? state.enabled : {};
+  for (const n of fresh) {
+    const dest = path.join(PLUGINS_DIR, n);
+    if (fs.existsSync(dest)) continue;
+    try { fs.copyFileSync(path.join(BUNDLED_DIR, n), dest); enabled[n] = true; } catch (e) {}
+  }
+  try { fs.writeFileSync(STATE_PATH, JSON.stringify({ ...state, enabled, bundled: seen.concat(fresh) })); } catch (e) {}
 }
 
 function parseMeta(code, fallbackName) {
