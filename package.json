@@ -1,5 +1,5 @@
 {
-  "name": "riff",
+  "name": "riff-spotify",
   "version": "42.3.0",
   "main": "main.js",
   "bin": {
@@ -14,9 +14,9 @@
     "release:major": "npm version major && git push --follow-tags"
   },
   "keywords": [],
-  "author": "rootscripts",
-  "license": "MIT",
-  "description": "made for humans, Riff - audio player.",
+  "author": "skibididobdob228",
+  "license": "GPL-3.0-only",
+  "description": "Riff with a Spotify search engine: Spotify catalog, YouTube Music audio.",
   "devDependencies": {
     "electron": "^41.7.1",
     "electron-builder": "^26.15.3"
@@ -29,18 +29,18 @@
     "tone": "^15.1.22"
   },
   "productName": "Riff",
-  "homepage": "https://github.com/rootscripts/riff",
+  "homepage": "https://github.com/skibididobdob228/riff-spotify",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rootscripts/riff.git"
+    "url": "git+https://github.com/skibididobdob228/riff-spotify.git"
   },
   "bugs": {
-    "url": "https://github.com/rootscripts/riff/issues"
+    "url": "https://github.com/skibididobdob228/riff-spotify/issues"
   },
   "build": {
-    "appId": "io.github.rootscripts.riff",
+    "appId": "io.github.skibididobdob228.riffspotify",
     "productName": "Riff",
-    "artifactName": "${name}-${version}-${os}-${arch}.${ext}",
+    "artifactName": "Riff-Spotify-${version}-${os}-${arch}.${ext}",
     "directories": {
       "output": "dist"
     },
@@ -68,7 +68,9 @@
     "nsis": {
       "oneClick": true,
       "perMachine": false,
-      "deleteAppDataOnUninstall": false
+      "deleteAppDataOnUninstall": false,
+      "shortcutName": "Riff Spotify",
+      "uninstallDisplayName": "Riff Spotify"
     },
     "linux": {
       "target": [
@@ -108,8 +110,8 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "rootscripts",
-        "repo": "riff",
+        "owner": "skibididobdob228",
+        "repo": "riff-spotify",
         "releaseType": "release"
       }
     ]
