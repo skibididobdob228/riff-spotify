@@ -147,6 +147,7 @@ const vibeCache = new Map();
 const ytArtistCache = new Map();
 const downloadingSet = new Set();
 const prefetchingSet = new Set();
+const downloadInFlight = new Map();
 
 let currentAppState = {};
 const sseClients = new Set();
@@ -351,48 +352,57 @@ async function searchSoundcloud(query, limit = 14) {
     return searchCache.get(cacheKey);
   }
 
-  const args = [
-    `scsearch${limit}:${query}`,
-    '--dump-single-json',
-    '--flat-playlist',
-    '--skip-download',
-    '--no-warnings',
-    '--no-check-certificates'
-  ];
-  try {
-    const raw = await executeYtDlp(args, 18000);
-    const data = JSON.parse(raw);
-    const entries = (data.entries || []).map((item) => {
-      let thumbnail = '';
-      if (item.thumbnails && item.thumbnails.length > 0) {
-        thumbnail = item.thumbnails[item.thumbnails.length - 1].url;
-      } else if (item.thumbnail) {
-        thumbnail = item.thumbnail;
+  const searchPromise = (async () => {
+    const args = [
+      `scsearch${limit}:${query}`,
+      '--dump-single-json',
+      '--flat-playlist',
+      '--skip-download',
+      '--no-warnings',
+      '--no-check-certificates'
+    ];
+    try {
+      const raw = await executeYtDlp(args, 18000);
+      const data = JSON.parse(raw);
+      const entries = (data.entries || []).map((item) => {
+        let thumbnail = '';
+        if (item.thumbnails && item.thumbnails.length > 0) {
+          thumbnail = item.thumbnails[item.thumbnails.length - 1].url;
+        } else if (item.thumbnail) {
+          thumbnail = item.thumbnail;
+        }
+
+        const cleanTitle = (item.title || 'untitled');
+        const cleanArtist = (item.uploader || item.channel || item.artist || 'unknown artist');
+        const trackUrl = item.webpage_url || item.url || '';
+
+        return {
+          id: String(item.id || Math.random().toString(36).substring(2)),
+          title: cleanTitle,
+          artist: cleanArtist,
+          duration: item.duration || 0,
+          thumbnail: thumbnail,
+          url: trackUrl,
+          platform: 'soundcloud'
+        };
+      });
+
+      if (entries.length > 0) {
+        searchCache.set(cacheKey, entries);
+        setTimeout(() => { searchCache.delete(cacheKey); }, 300000);
+      } else if (searchCache.get(cacheKey) === searchPromise) {
+        searchCache.delete(cacheKey);
       }
-
-      const cleanTitle = (item.title || 'untitled');
-      const cleanArtist = (item.uploader || item.channel || item.artist || 'unknown artist');
-      const trackUrl = item.webpage_url || item.url || '';
-
-      return {
-        id: String(item.id || Math.random().toString(36).substring(2)),
-        title: cleanTitle,
-        artist: cleanArtist,
-        duration: item.duration || 0,
-        thumbnail: thumbnail,
-        url: trackUrl,
-        platform: 'soundcloud'
-      };
-    });
-
-    if (entries.length > 0) {
-      searchCache.set(cacheKey, entries);
-      setTimeout(() => { searchCache.delete(cacheKey); }, 300000);
+      return entries;
+    } catch (err) {
+      if (searchCache.get(cacheKey) === searchPromise) {
+        searchCache.delete(cacheKey);
+      }
+      return [];
     }
-    return entries;
-  } catch (err) {
-    return [];
-  }
+  })();
+  searchCache.set(cacheKey, searchPromise);
+  return searchPromise;
 }
 
 function buildDiscoveryQueries(profile) {
@@ -475,7 +485,15 @@ async function httpGetJson(url, timeoutMs = 6000) {
           return resolve(null);
         }
         let data = '';
-        res.on('data', chunk => { data += chunk; });
+        let bytesRead = 0;
+        res.on('data', chunk => {
+          bytesRead += chunk.length;
+          if (bytesRead > 1024 * 1024) {
+            res.destroy();
+            return resolve(null);
+          }
+          data += chunk;
+        });
         res.on('end', () => {
           try {
             resolve(JSON.parse(data));
@@ -507,15 +525,26 @@ async function dzArtistId(name) {
   if (cached && Date.now() < cached.expires) {
     return cached.id;
   }
-  try {
-    const url = `https://api.deezer.com/search/artist?q=${encodeURIComponent(name.trim())}&limit=1`;
-    const data = await httpGetJson(url, 6000);
-    const id = data?.data?.[0]?.id ? String(data.data[0].id) : null;
-    dzArtistIdCache.set(clean, { id, expires: Date.now() + 24 * 3600 * 1000 });
-    return id;
-  } catch (_) {
-    return null;
+  if (cached?.promise) {
+    return cached.promise;
   }
+
+  const lookupPromise = (async () => {
+    try {
+      const url = `https://api.deezer.com/search/artist?q=${encodeURIComponent(name.trim())}&limit=1`;
+      const data = await httpGetJson(url, 6000);
+      const id = data?.data?.[0]?.id ? String(data.data[0].id) : null;
+      dzArtistIdCache.set(clean, { id, expires: Date.now() + 24 * 3600 * 1000 });
+      return id;
+    } catch (_) {
+      if (dzArtistIdCache.get(clean)?.promise === lookupPromise) {
+        dzArtistIdCache.delete(clean);
+      }
+      return null;
+    }
+  })();
+  dzArtistIdCache.set(clean, { promise: lookupPromise, expires: 0 });
+  return lookupPromise;
 }
 
 async function dzRelatedTracks(artist) {
@@ -582,59 +611,69 @@ async function ytMixTracks(seed) {
   if (cached && Date.now() < cached.expires) {
     return cached.tracks;
   }
-
-  try {
-    const args = [
-      '--flat-playlist',
-      '--dump-single-json',
-      '--no-warnings',
-      '--no-check-certificates',
-      '--playlist-end',
-      '25',
-      '--extractor-args',
-      'youtube:player_client=android',
-      `https://www.youtube.com/watch?v=${id}&list=RD${id}`
-    ];
-    const raw = await executeYtDlp(args, 25000);
-    const data = JSON.parse(raw);
-    const entries = Array.isArray(data?.entries) ? data.entries : [];
-    const results = [];
-
-    entries.forEach((entry, index) => {
-      if (!entry || !entry.id || entry.id === id) return;
-      const duration = Number(entry.duration) || 0;
-      if (duration > 480) return;
-      const artist = entry.uploader || entry.channel || 'unknown artist';
-      const title = entry.title || 'untitled';
-      if (isSpamOrUnofficial(title, duration, artist)) return;
-
-      let thumbnail = '';
-      if (Array.isArray(entry.thumbnails) && entry.thumbnails.length > 0) {
-        thumbnail = entry.thumbnails[entry.thumbnails.length - 1].url || '';
-      } else if (entry.thumbnail) {
-        thumbnail = entry.thumbnail;
-      }
-
-      results.push({
-        id: entry.id,
-        title,
-        artist,
-        duration,
-        thumbnail,
-        url: `https://www.youtube.com/watch?v=${entry.id}`,
-        platform: 'youtube',
-        isCached: false,
-        match: 1 - (index / 25) * 0.5,
-        source: 'ytmix',
-        playable: true
-      });
-    });
-
-    ytMixCache.set(id, { expires: Date.now() + 30 * 60 * 1000, tracks: results });
-    return results;
-  } catch (_) {
-    return [];
+  if (cached?.promise) {
+    return cached.promise;
   }
+
+  const lookupPromise = (async () => {
+    try {
+      const args = [
+        '--flat-playlist',
+        '--dump-single-json',
+        '--no-warnings',
+        '--no-check-certificates',
+        '--playlist-end',
+        '25',
+        '--extractor-args',
+        'youtube:player_client=android',
+        `https://www.youtube.com/watch?v=${id}&list=RD${id}`
+      ];
+      const raw = await executeYtDlp(args, 25000);
+      const data = JSON.parse(raw);
+      const entries = Array.isArray(data?.entries) ? data.entries : [];
+      const results = [];
+
+      entries.forEach((entry, index) => {
+        if (!entry || !entry.id || entry.id === id) return;
+        const duration = Number(entry.duration) || 0;
+        if (duration > 480) return;
+        const artist = entry.uploader || entry.channel || 'unknown artist';
+        const title = entry.title || 'untitled';
+        if (isSpamOrUnofficial(title, duration, artist)) return;
+
+        let thumbnail = '';
+        if (Array.isArray(entry.thumbnails) && entry.thumbnails.length > 0) {
+          thumbnail = entry.thumbnails[entry.thumbnails.length - 1].url || '';
+        } else if (entry.thumbnail) {
+          thumbnail = entry.thumbnail;
+        }
+
+        results.push({
+          id: entry.id,
+          title,
+          artist,
+          duration,
+          thumbnail,
+          url: `https://www.youtube.com/watch?v=${entry.id}`,
+          platform: 'youtube',
+          isCached: false,
+          match: 1 - (index / 25) * 0.5,
+          source: 'ytmix',
+          playable: true
+        });
+      });
+
+      ytMixCache.set(id, { expires: Date.now() + 30 * 60 * 1000, tracks: results });
+      return results;
+    } catch (_) {
+      if (ytMixCache.get(id)?.promise === lookupPromise) {
+        ytMixCache.delete(id);
+      }
+      return [];
+    }
+  })();
+  ytMixCache.set(id, { expires: 0, promise: lookupPromise });
+  return lookupPromise;
 }
 
 async function gatherCandidates(seeds) {
@@ -768,32 +807,42 @@ async function resolveCandidate(c) {
   if (cached && Date.now() < cached.expires) {
     return cached.track;
   }
+  if (cached?.promise) {
+    return cached.promise;
+  }
 
-  let resolved = null;
-  try {
-    const candArtistNorm = normalizeArtistName(c.artist);
-    const candTitleNorm = (c.title || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-    const query = `${c.artist} ${c.title}`.trim();
-    const scResults = await searchSoundcloud(query, 4);
+  const lookupPromise = (async () => {
+    let resolved = null;
+    try {
+      const candArtistNorm = normalizeArtistName(c.artist);
+      const candTitleNorm = (c.title || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+      const query = `${c.artist} ${c.title}`.trim();
+      const scResults = await searchSoundcloud(query, 4);
 
-    for (const r of (scResults || [])) {
-      const rArtistNorm = normalizeArtistName(r.artist || r.uploader || '');
-      const rTitleNorm = (r.title || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-      const artistMatch = rArtistNorm.includes(candArtistNorm) || candArtistNorm.includes(rArtistNorm);
-      const titleMatch = rTitleNorm.includes(candTitleNorm) || candTitleNorm.includes(rTitleNorm);
-      if (artistMatch && titleMatch) {
-        resolved = normalizeTrack(r);
-        break;
+      for (const r of (scResults || [])) {
+        const rArtistNorm = normalizeArtistName(r.artist || r.uploader || '');
+        const rTitleNorm = (r.title || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+        const artistMatch = rArtistNorm.includes(candArtistNorm) || candArtistNorm.includes(rArtistNorm);
+        const titleMatch = rTitleNorm.includes(candTitleNorm) || candTitleNorm.includes(rTitleNorm);
+        if (artistMatch && titleMatch) {
+          resolved = normalizeTrack(r);
+          break;
+        }
       }
+    } catch (_) {}
+
+    if (resolvedCache.get(key)?.promise === lookupPromise) {
+      resolvedCache.set(key, { expires: Date.now() + 24 * 3600 * 1000, track: resolved });
     }
-  } catch (_) {}
+    return resolved;
+  })();
 
   if (resolvedCache.size >= 500) {
     const oldest = resolvedCache.keys().next().value;
     resolvedCache.delete(oldest);
   }
-  resolvedCache.set(key, { expires: Date.now() + 24 * 3600 * 1000, track: resolved });
-  return resolved;
+  resolvedCache.set(key, { expires: 0, promise: lookupPromise });
+  return lookupPromise;
 }
 
 function pickWeightedSeeds(seeds, count = 4) {
@@ -1446,11 +1495,32 @@ async function searchYtmTracks(query, limit = 16) {
 
 async function handleSearch(req, res, query, platform = 'youtube', limit = 20) {
   const cacheKey = `${platform}:${query}:${limit}`;
-  if (searchCache.has(cacheKey)) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(searchCache.get(cacheKey)));
+  while (true) {
+    const cached = searchCache.get(cacheKey);
+    if (cached === undefined) break;
+    if (cached?.promise instanceof Promise) {
+      const outcome = await cached.promise;
+      res.writeHead(outcome.status, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(outcome.body));
+    }
+    if (searchCache.has(cacheKey)) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(cached));
+    }
   }
 
+  let resolveSearchOutcome;
+  const searchOutcome = new Promise(resolve => { resolveSearchOutcome = resolve; });
+  const cacheEntry = { promise: searchOutcome };
+  searchCache.set(cacheKey, cacheEntry);
+  let responseOutcome = null;
+  const sendResponse = (status, body) => {
+    responseOutcome = { status, body };
+    resolveSearchOutcome(responseOutcome);
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(body));
+  };
+  try {
   if (platform === 'spotify') {
     try {
       const tracks = await spotifyEngine.search(query, limit);
@@ -1465,12 +1535,10 @@ async function handleSearch(req, res, query, platform = 'youtube', limit = 20) {
             .catch(() => {});
         }, 60);
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(result));
+      return sendResponse(200, result);
     } catch (err) {
       try { logger.log('error', `spotify search failed: ${err.message}`); } catch (_) {}
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: false, tracks: [], error: 'Spotify search is unavailable' }));
+      return sendResponse(200, { success: false, tracks: [], error: 'Spotify search is unavailable' });
     }
   }
 
@@ -1487,8 +1555,7 @@ async function handleSearch(req, res, query, platform = 'youtube', limit = 20) {
           }
         }, 100);
 
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify(result));
+        return sendResponse(200, result);
       }
     } catch (e) {}
   }
@@ -1510,8 +1577,7 @@ async function handleSearch(req, res, query, platform = 'youtube', limit = 20) {
           setTimeout(() => {
             if (entries[0] && entries[0].url) prefetchTrack(entries[0].url, entries[0].id, 'youtube').catch(() => {});
           }, 60);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify(result));
+          return sendResponse(200, result);
         } else {
           ytmFailCount++;
           if (ytmFailCount >= 3) {
@@ -1617,11 +1683,9 @@ async function handleSearch(req, res, query, platform = 'youtube', limit = 20) {
       setTimeout(() => {
         if (entries[0] && entries[0].url) prefetchTrack(entries[0].url, entries[0].id, 'youtube').catch(() => {});
       }, 60);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(result));
+      return sendResponse(200, result);
     } catch (err) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: false, tracks: [], error: 'YouTube Music is unavailable' }));
+      return sendResponse(200, { success: false, tracks: [], error: 'YouTube Music is unavailable' });
     }
   }
 
@@ -1679,11 +1743,19 @@ async function handleSearch(req, res, query, platform = 'youtube', limit = 20) {
       if (entries[0] && entries[0].url) prefetchTrack(entries[0].url, entries[0].id, platform).catch(() => {});
     }, 60);
 
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(result));
+    return sendResponse(200, result);
   } catch (err) {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: false, error: err.message }));
+    return sendResponse(500, { success: false, error: err.message });
+  }
+  } finally {
+    if (!responseOutcome) {
+      const outcome = { status: 500, body: { success: false, error: 'Search failed' } };
+      responseOutcome = outcome;
+      resolveSearchOutcome(outcome);
+    }
+    if (searchCache.get(cacheKey) === cacheEntry) {
+      searchCache.delete(cacheKey);
+    }
   }
 }
 
@@ -1749,6 +1821,11 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
   const cacheKey = (cleanId || trackUrl || `${artist}_${title}`).toLowerCase();
   if (cacheKey && (streamUrlCache.has(cacheKey) || (cleanId && streamUrlCache.has(cleanId)))) {
     const cached = streamUrlCache.get(cacheKey) || (cleanId ? streamUrlCache.get(cleanId) : null);
+    if (cached?.promise) {
+      const outcome = await cached.promise;
+      res.writeHead(outcome.success ? 200 : 500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(outcome));
+    }
     if (cached && (Date.now() - cached.timestamp < 1800000)) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       if (cleanId) setTimeout(() => downloadTrackToDisk(trackUrl, cleanId, platform, meta), 10000);
@@ -1756,6 +1833,12 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
     }
   }
 
+  let resolveLookup;
+  const lookupPromise = new Promise(resolve => { resolveLookup = resolve; });
+  const inFlightEntry = { promise: lookupPromise };
+  if (cacheKey) streamUrlCache.set(cacheKey, inFlightEntry);
+
+  try {
   if (platform === 'youtube' && (!trackUrl || !trackUrl.startsWith('http')) && cleanId) {
     trackUrl = `https://www.youtube.com/watch?v=${cleanId}`;
   }
@@ -1791,8 +1874,13 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
 
   if (!streamUrl) {
     try { logger.error('Stream resolve failed: ' + (title || trackUrl)); } catch (_) {}
+    const failure = { success: false, error: 'could not extract audio stream' };
+    resolveLookup(failure);
+    if (cacheKey && streamUrlCache.get(cacheKey) === inFlightEntry) {
+      streamUrlCache.delete(cacheKey);
+    }
     res.writeHead(500, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ success: false, error: 'could not extract audio stream' }));
+    return res.end(JSON.stringify(failure));
   }
 
   const isHls = streamUrl.includes('.m3u8');
@@ -1804,12 +1892,22 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
     proxyUrl: `http://127.0.0.1:${PORT}/api/audio-proxy?url=${encodeURIComponent(streamUrl)}`
   };
 
+  resolveLookup(data);
   if (cacheKey) streamUrlCache.set(cacheKey, { timestamp: Date.now(), data });
   if (cleanId && cleanId !== cacheKey) streamUrlCache.set(cleanId, { timestamp: Date.now(), data });
   if (cleanId) setTimeout(() => downloadTrackToDisk(trackUrl, cleanId, platform, meta), 10000);
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(data));
+  } catch (error) {
+    const failure = { success: false, error: error.message };
+    resolveLookup(failure);
+    if (cacheKey && streamUrlCache.get(cacheKey) === inFlightEntry) {
+      streamUrlCache.delete(cacheKey);
+    }
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(failure));
+  }
 }
 
 async function fetchArtistInfo(artistName) {
@@ -2216,6 +2314,107 @@ async function cleanupDownloadArtifacts(dir, beforeSet, baseName, videoId, chose
   } catch (_) {}
 }
 
+// ---- cover art for local library tracks: embedded picture first, then iTunes ----
+const localCoverQueued = new Set();
+const localCoverQueue = [];
+let localCoverWorking = false;
+let lastOnlineCoverLookup = 0;
+
+function localCoverPath(id) {
+  return path.join(THUMBNAILS_DIR, `localcover_${id}.jpg`);
+}
+
+function extractEmbeddedCover(src, dest) {
+  return new Promise((resolve) => {
+    const ffmpegBin = resolveBinary('ffmpeg');
+    if (!ffmpegBin || !fs.existsSync(src)) return resolve(false);
+    const tmp = `${dest}.tmp.jpg`;
+    let proc;
+    try {
+      proc = spawn(ffmpegBin, ['-y', '-v', 'error', '-i', src, '-map', '0:v:0', '-frames:v', '1', '-vf', "scale='min(600,iw)':-2", tmp], { windowsHide: true });
+    } catch (e) { return resolve(false); }
+    const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 20000);
+    proc.on('error', () => { clearTimeout(timer); resolve(false); });
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      try {
+        if (code === 0 && fs.existsSync(tmp) && fs.statSync(tmp).size > 500) {
+          fs.renameSync(tmp, dest);
+          return resolve(true);
+        }
+        fs.rmSync(tmp, { force: true });
+      } catch (_) {}
+      resolve(false);
+    });
+  });
+}
+
+async function fetchOnlineCover(item, dest) {
+  try {
+    const norm = (s) => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    const title = (item.title || '').replace(/\(.*?\)|\[.*?\]/g, '').trim();
+    if (!title) return false;
+    const artist = item.artist && !/^unknown artist$/i.test(item.artist) ? item.artist : '';
+    const term = `${artist} ${title}`.trim();
+    const data = await fetchItunesJson(`https://itunes.apple.com/search?term=${encodeURIComponent(term)}&entity=song&limit=5${itunesCountryParam()}`);
+    const results = (data && Array.isArray(data.results)) ? data.results : [];
+    const hit = results.find(r => r && r.artworkUrl100 && norm(r.trackName).includes(norm(title)) && (!artist || norm(r.artistName).includes(norm(artist)) || norm(artist).includes(norm(r.artistName))));
+    if (!hit) return false;
+    const res = await fetch(hit.artworkUrl100.replace('100x100', '600x600'));
+    if (!res.ok) return false;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length < 500) return false;
+    await fs.promises.writeFile(dest, buf);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function processLocalCovers() {
+  if (localCoverWorking) return;
+  localCoverWorking = true;
+  try {
+    while (localCoverQueue.length) {
+      const id = localCoverQueue.shift();
+      const item = libraryIndex[id];
+      if (!item) continue;
+      const dest = localCoverPath(id);
+      if (fs.existsSync(dest)) continue;
+      let ok = await extractEmbeddedCover(path.join(LIBRARY_DIR, item.file), dest);
+      if (!ok) {
+        // iTunes allows only a few lookups per minute, so space them out
+        const wait = 4000 - (Date.now() - lastOnlineCoverLookup);
+        if (wait > 0) await new Promise(r => setTimeout(r, wait));
+        lastOnlineCoverLookup = Date.now();
+        ok = await fetchOnlineCover(item, dest);
+      }
+    }
+  } finally {
+    localCoverWorking = false;
+  }
+}
+
+function queueLocalCovers(ids) {
+  for (const id of ids) {
+    if (localCoverQueued.has(id) || fs.existsSync(localCoverPath(id))) continue;
+    localCoverQueued.add(id);
+    localCoverQueue.push(id);
+  }
+  if (localCoverQueue.length) processLocalCovers().catch(() => {});
+}
+
+function handleLocalCover(req, res, parsedUrl) {
+  const id = String(parsedUrl.query.id || '');
+  const file = /^[\w-]{1,64}$/.test(id) && libraryIndex[id] ? localCoverPath(id) : '';
+  if (!file || !fs.existsSync(file)) {
+    res.writeHead(404);
+    return res.end();
+  }
+  res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'max-age=3600' });
+  fs.createReadStream(file).pipe(res);
+}
+
 async function handleDownload(req, res, trackUrl, title, artist, format = 'mp3', quality = '0', startParam = null, endParam = null, raw = false, trackId = null, streamUrlParam = null) {
   if (!trackUrl && (!title || !artist)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2268,6 +2467,27 @@ async function handleDownload(req, res, trackUrl, title, artist, format = 'mp3',
     if (vidMatch) cleanId = cleanTrackId(vidMatch[1]);
   }
 
+  const downloadKey = !isRaw ? JSON.stringify([cleanId || targetUrl, cleanArtist, cleanTitle, ext, safeQuality, start, end]) : null;
+  if (downloadKey && downloadInFlight.has(downloadKey)) {
+    const outcome = await downloadInFlight.get(downloadKey);
+    res.writeHead(outcome.status, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(outcome.body));
+  }
+
+  let resolveDownload;
+  const downloadPromise = downloadKey ? new Promise(resolve => { resolveDownload = resolve; }) : null;
+  if (downloadKey) downloadInFlight.set(downloadKey, downloadPromise);
+  let downloadOutcome = null;
+  const sendDownloadResponse = (status, body) => {
+    downloadOutcome = { status, body };
+    if (resolveDownload) resolveDownload(downloadOutcome);
+    if (!res.writableEnded) {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    }
+  };
+
+  try {
   const cachedFile = cleanId ? await findCachedFile(cleanId) : null;
   if (cachedFile) {
     const ffmpegBin = resolveBinary('ffmpeg');
@@ -2303,18 +2523,14 @@ async function handleDownload(req, res, trackUrl, title, artist, format = 'mp3',
           ffmpegProc.on('error', reject);
         });
         downloadsIndex = null;
-        if (!res.writableEnded) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify(isRaw ? {
-            success: true,
-            tempName: tempName
-          } : {
-            success: true,
-            filename: outFilename,
-            directory: downloadsDir
-          }));
-        }
-        return;
+        return sendDownloadResponse(200, isRaw ? {
+          success: true,
+          tempName: tempName
+        } : {
+          success: true,
+          filename: outFilename,
+          directory: downloadsDir
+        });
       } catch (cachedErr) {
         try { await fs.promises.unlink(outPath); } catch (_) {}
       }
@@ -2384,20 +2600,20 @@ async function handleDownload(req, res, trackUrl, title, artist, format = 'mp3',
       await cleanupDownloadArtifacts(downloadsDir, beforeFiles, baseName, videoId, ext, true);
       downloadsIndex = null;
     }
-    if (!res.writableEnded) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(isRaw ? {
-        success: true,
-        tempName: tempName
-      } : {
-        success: true,
-        filename: outFilename,
-        directory: downloadsDir
-      }));
-    }
+    sendDownloadResponse(200, isRaw ? {
+      success: true,
+      tempName: tempName
+    } : {
+      success: true,
+      filename: outFilename,
+      directory: downloadsDir
+    });
   } catch (err) {
     try { logger.error('Download primary failed: ' + (title || trackUrl), err); } catch (_) {}
-    if (res.writableEnded) return;
+    if (res.writableEnded) {
+      sendDownloadResponse(500, { success: false, error: err.message });
+      return;
+    }
     try {
       const fallbackArgs = [
         '--no-playlist',
@@ -2422,17 +2638,14 @@ async function handleDownload(req, res, trackUrl, title, artist, format = 'mp3',
         await cleanupDownloadArtifacts(downloadsDir, beforeFiles, baseName, videoId, ext, true);
         downloadsIndex = null;
       }
-      if (!res.writableEnded) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(isRaw ? {
-          success: true,
-          tempName: tempName
-        } : {
-          success: true,
-          filename: outFilename,
-          directory: downloadsDir
-        }));
-      }
+      sendDownloadResponse(200, isRaw ? {
+        success: true,
+        tempName: tempName
+      } : {
+        success: true,
+        filename: outFilename,
+        directory: downloadsDir
+      });
     } catch (e2) {
       if (!isRaw) {
         await cleanupDownloadArtifacts(downloadsDir, beforeFiles, baseName, videoId, ext, false);
@@ -2440,10 +2653,15 @@ async function handleDownload(req, res, trackUrl, title, artist, format = 'mp3',
         await cleanupPartial();
       }
       try { logger.error('Download failure: ' + (title || trackUrl) + ' (' + (e2.message || err.message) + ')', e2); } catch (_) {}
-      if (!res.writableEnded) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: e2.message || err.message }));
-      }
+      sendDownloadResponse(500, { success: false, error: e2.message || err.message });
+    }
+  }
+  } finally {
+    if (downloadKey && downloadInFlight.get(downloadKey) === downloadPromise) {
+      downloadInFlight.delete(downloadKey);
+    }
+    if (resolveDownload && !downloadOutcome) {
+      resolveDownload({ status: 500, body: { success: false, error: 'Download ended without a result' } });
     }
   }
 }
@@ -2684,6 +2902,10 @@ const TOKEN_PROTECTED_ROUTES = new Set([
   '/api/download',
   '/api/spotify-import',
   '/api/spotify-artist',
+  '/api/spotify-auth-start',
+  '/api/spotify-status',
+  '/api/spotify-library',
+  '/api/spotify-logout',
   '/api/prefetch',
   '/api/check-cache',
   '/api/stream-info',
@@ -2742,12 +2964,30 @@ function getFetchedLyricsPath(title, artist) {
 
 async function handleLyrics(req, res, title, artist, allowOnline = true) {
   const cacheKey = `${artist}:${title}`;
-  if (lyricsCache.has(cacheKey)) {
-    const cached = lyricsCache.get(cacheKey);
+  const cached = lyricsCache.get(cacheKey);
+  if (cached?.promise) {
+    const outcome = await cached.promise;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(outcome));
+  }
+  if (cached) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ success: true, lyrics: cached.text, isCustom: cached.isCustom || false }));
   }
 
+  let resolveLyrics;
+  const lyricsPromise = new Promise(resolve => { resolveLyrics = resolve; });
+  const inFlightEntry = { promise: lyricsPromise };
+  lyricsCache.set(cacheKey, inFlightEntry);
+  let outcome = null;
+  const sendLyrics = (lyrics, isCustom = false) => {
+    outcome = { success: true, lyrics, isCustom };
+    resolveLyrics(outcome);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(outcome));
+  };
+
+  try {
   let customPath = getCustomLyricsPath(title, artist);
   if (!fs.existsSync(customPath) && /^[\x00-\x7F]*$/.test((title || '') + (artist || ''))) {
     const legacyPath = legacyCustomLyricsPath(title, artist);
@@ -2759,9 +2999,10 @@ async function handleLyrics(req, res, title, artist, allowOnline = true) {
   if (fs.existsSync(customPath)) {
     try {
       const customLyrics = await fs.promises.readFile(customPath, 'utf-8');
-      lyricsCache.set(cacheKey, { text: customLyrics, isCustom: true });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: true, lyrics: customLyrics, isCustom: true }));
+      if (lyricsCache.get(cacheKey) === inFlightEntry) {
+        lyricsCache.set(cacheKey, { text: customLyrics, isCustom: true });
+      }
+      return sendLyrics(customLyrics, true);
     } catch (e) {}
   }
 
@@ -2776,15 +3017,15 @@ async function handleLyrics(req, res, title, artist, allowOnline = true) {
   if (fs.existsSync(fetchedLyricsPath)) {
     try {
       const diskLyrics = await fs.promises.readFile(fetchedLyricsPath, 'utf-8');
-      lyricsCache.set(cacheKey, { text: diskLyrics, isCustom: false });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: true, lyrics: diskLyrics, isCustom: false }));
+      if (lyricsCache.get(cacheKey) === inFlightEntry) {
+        lyricsCache.set(cacheKey, { text: diskLyrics, isCustom: false });
+      }
+      return sendLyrics(diskLyrics);
     } catch (e) {}
   }
 
   if (!allowOnline) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ success: true, lyrics: '' }));
+    return sendLyrics('');
   }
 
   try {
@@ -2794,13 +3035,21 @@ async function handleLyrics(req, res, title, artist, allowOnline = true) {
         await fs.promises.writeFile(fetchedLyricsPath, rawLyrics, 'utf-8');
       } catch (e) {}
     }
-    lyricsCache.set(cacheKey, { text: rawLyrics, isCustom: false });
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true, lyrics: rawLyrics }));
+    if (lyricsCache.get(cacheKey) === inFlightEntry) {
+      lyricsCache.set(cacheKey, { text: rawLyrics, isCustom: false });
+    }
+    return sendLyrics(rawLyrics);
   } catch (err) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true, lyrics: '' }));
+    return sendLyrics('');
+  }
+  } finally {
+    if (!outcome) {
+      outcome = { success: true, lyrics: '', isCustom: false };
+      resolveLyrics(outcome);
+    }
+    if (lyricsCache.get(cacheKey) === inFlightEntry) {
+      lyricsCache.delete(cacheKey);
+    }
   }
 }
 
@@ -2886,10 +3135,11 @@ async function fetchFullSpotifyPlaylist(playlistId, accessToken) {
   while (offset < total && guard++ < 100) {
     const page = await pathfinderRequest(accessToken, { uri, offset, limit: 100, enableWatchFeedEntrypoint: true });
     const pageItems = page?.data?.playlistV2?.content?.items;
-    if (!Array.isArray(pageItems) || pageItems.length === 0) break;
+    if (!Array.isArray(pageItems) || pageItems.length === 0) throw new Error('Incomplete Pathfinder playlist');
     items.push(...pageItems);
     offset += pageItems.length;
   }
+  if (offset < total) throw new Error('Incomplete Pathfinder playlist');
   const tracks = items.map(it => {
     const t = it?.itemV2?.data || it?.item?.data || {};
     const artists = (t.albumOfTrack?.artists?.items || []).map(a => a.profile?.name).filter(Boolean);
@@ -2901,39 +3151,37 @@ async function fetchFullSpotifyPlaylist(playlistId, accessToken) {
 }
 
 async function trySpotifyWebApi(playlistId) {
-  if (!spotifyAuth || !spotifyAuth.token) return null;
+  loadSpotifyAuth();
+  if (!spotifyAuth.token && !spotifyAuth.refreshToken) return null;
   try {
-    const resp = await spotifyGetWithRetry(`https://api.spotify.com/v1/playlists/${encodeURIComponent(playlistId)}`, spotifyAuth.token);
+    const resp = await spotifyGetWithRetry(`https://api.spotify.com/v1/playlists/${encodeURIComponent(playlistId)}`);
     if (resp.status >= 200 && resp.status < 300) {
       const d = JSON.parse(resp.body);
       const name = d.name || 'Spotify Playlist';
       const cover = (d.images && Array.isArray(d.images) && d.images[0] && d.images[0].url) ? d.images[0].url : '';
-      let items = (d.tracks && Array.isArray(d.tracks.items)) ? d.tracks.items.slice() : [];
-      let nextUrl = d.tracks?.next;
+      const playlistItems = d.items || d.tracks;
+      if (!Array.isArray(playlistItems?.items)) return null;
+      let items = playlistItems.items.slice();
+      let nextUrl = playlistItems?.next;
       let guard = 0;
       while (nextUrl && guard++ < 100) {
-        const nextResp = await spotifyGetWithRetry(nextUrl, spotifyAuth.token);
-        if (nextResp.status >= 200 && nextResp.status < 300) {
-          const nextData = JSON.parse(nextResp.body);
-          if (Array.isArray(nextData.items) && nextData.items.length) {
-            items.push(...nextData.items);
-            nextUrl = nextData.next;
-          } else {
-            break;
-          }
-        } else {
-          break;
-        }
+        const nextResp = await spotifyGetWithRetry(nextUrl);
+        if (nextResp.status < 200 || nextResp.status >= 300) return null;
+        const nextData = JSON.parse(nextResp.body);
+        if (!Array.isArray(nextData.items) || !nextData.items.length) return null;
+        items.push(...nextData.items);
+        nextUrl = nextData.next;
       }
+      if (nextUrl || (Number.isInteger(playlistItems.total) && items.length < playlistItems.total)) return null;
       const tracks = items.map(it => {
-        const t = it.track || it;
+        const t = it?.item || it?.track || it || {};
         return {
           title: t.name || '',
           artist: Array.isArray(t.artists) ? t.artists.map(a => a.name).join(', ') : '',
           duration: t.duration_ms ? Math.round(t.duration_ms / 1000) : undefined
         };
       }).filter(t => t.title);
-      return { success: true, name, cover, tracks, total: d.tracks?.total || tracks.length };
+      return { success: true, name, cover, tracks, total: tracks.length };
     }
   } catch (e) {}
   return null;
@@ -2969,12 +3217,17 @@ function fetchSpotifyEmbed(playlistId, ua) {
 }
 
 async function handleSpotifyImport(req, res, inputUrl) {
-  const m = (inputUrl || '').match(/playlist[/:]([a-zA-Z0-9]+)/);
+  const m = (inputUrl || '').match(/^(?:(?:https:\/\/)?open\.spotify\.com\/(?:embed\/)?playlist\/|spotify:playlist:)([a-zA-Z0-9]{22})(?:[/?#]|$)/);
   if (!m) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ success: false, code: 'spotify_error', error: 'Invalid Spotify playlist URL' }));
   }
   const playlistId = m[1];
+  const apiResult = await trySpotifyWebApi(playlistId);
+  if (apiResult && apiResult.tracks.length) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(apiResult));
+  }
   const primaryUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   const retryUa = 'Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0';
 
@@ -3011,12 +3264,6 @@ async function handleSpotifyImport(req, res, inputUrl) {
     const body = embedRes.body;
     const nextDataMatch = body.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
     if (!nextDataMatch) {
-      const apiFallback = await trySpotifyWebApi(playlistId);
-      if (apiFallback && apiFallback.tracks.length) {
-        const hasMore = apiFallback.total > apiFallback.tracks.length;
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ success: true, name: apiFallback.name, cover: apiFallback.cover || '', tracks: apiFallback.tracks, hasMore, total: apiFallback.total }));
-      }
       const isPriv = /private/i.test(body);
       res.writeHead(403, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ success: false, code: isPriv ? 'spotify_forbidden' : 'spotify_error', error: isPriv ? 'Private playlist' : 'Could not parse playlist' }));
@@ -3048,7 +3295,7 @@ async function handleSpotifyImport(req, res, inputUrl) {
         const full = await fetchFullSpotifyPlaylist(playlistId, accessToken);
         if (full && full.tracks && full.tracks.length) {
           tracks = full.tracks;
-          total = full.total || full.tracks.length;
+          total = full.tracks.length;
         } else {
           limited = true;
           try { logger.log('warn', 'Spotify pathfinder non-200 or empty, falling back to embed trackList'); } catch (_) {}
@@ -3102,18 +3349,16 @@ async function handleSpotifyImport(req, res, inputUrl) {
     }
 
     if (!tracks.length) {
-      const apiFallback = await trySpotifyWebApi(playlistId);
-      if (apiFallback && apiFallback.tracks.length) {
-        const hasMore = apiFallback.total > apiFallback.tracks.length;
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ success: true, name: apiFallback.name, cover: apiFallback.cover || cover, tracks: apiFallback.tracks, hasMore, total: apiFallback.total, limited }));
-      }
       const isPriv = /private/i.test(body) || /private/i.test(JSON.stringify(pageProps || {}));
       res.writeHead(403, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ success: false, code: isPriv ? 'spotify_forbidden' : 'spotify_error', error: isPriv ? 'Private playlist' : 'Could not read tracks' }));
     }
 
-    const hasMore = total > tracks.length;
+    if (limited && (!Array.isArray(entity?.trackList) || !Number.isInteger(entity.totalCount) || entity.totalCount > entity.trackList.length || entity.trackList.length > 100)) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, code: 'spotify_incomplete', error: 'Spotify exposed only part of this playlist. Connect your account or use Export files.' }));
+    }
+    const hasMore = false;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, name, cover, tracks, hasMore, total, limited }));
   } catch (err) {
@@ -3156,6 +3401,33 @@ function fetchHtmlWithRedirects(targetUrl, maxRedirects = 5, timeoutMs = 15000) 
 }
 
 async function handleAppleImport(req, res, inputUrl) {
+  const albumMatch = (inputUrl || '').match(/music\.apple\.com\/(?:[a-z]{2}\/)?album\/(?:[^/]+\/)?(\d+)/i);
+  if (albumMatch) {
+    try {
+      const data = await fetchItunesJson(`https://itunes.apple.com/lookup?id=${albumMatch[1]}&entity=song`);
+      const results = (data && Array.isArray(data.results)) ? data.results : [];
+      const albumItem = results.find(r => r && r.wrapperType === 'collection');
+      if (albumItem) {
+        const tracks = results
+          .filter(r => r && r.wrapperType === 'track')
+          .map(item => ({
+            title: item.trackName || '',
+            artist: item.artistName || albumItem.artistName || '',
+            duration: item.trackTimeMillis ? Math.round(item.trackTimeMillis / 1000) : 0
+          }));
+        if (tracks.length > 0) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            success: true,
+            name: albumItem.collectionName || 'Album',
+            cover: (albumItem.artworkUrl100 || '').replace('100x100', '600x600'),
+            tracks
+          }));
+        }
+      }
+    } catch (_) {}
+  }
+
   const m = (inputUrl || '').match(/music\.apple\.com\/.*?(pl\.(?:u-)?[a-zA-Z0-9_-]+)/i);
   if (!m) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -3303,7 +3575,58 @@ async function handlePlaylistImport(req, res, inputUrl) {
     return res.end(JSON.stringify({ success: false, error: 'Unsupported link' }));
   }
 
-  const platform = isSoundCloud ? 'soundcloud' : 'youtube';
+  const platform = isSoundCloud ? 'soundcloud' : (host === 'music.youtube.com' ? 'ytmusic' : 'youtube');
+
+  if (isSoundCloud && inputUrl.includes('/sets/')) {
+    try {
+      const page = await fetch(inputUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }).then(r => r.text());
+      const hyd = page.match(/window\.__sc_hydration\s*=\s*(\[[\s\S]*?\]);\s*<\/script>/);
+      if (hyd) {
+        const list = JSON.parse(hyd[1]);
+        const pl = list.find(x => x.hydratable === 'playlist')?.data;
+        if (pl && Array.isArray(pl.tracks)) {
+          let cid = 'tHVbSbDP4TaoMbPppngv6Tdry83vNbMQ';
+          const scripts = [...page.matchAll(/src="(https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js)"/g)].map(x => x[1]);
+          for (const s of scripts) {
+            try {
+              const code = await fetch(s).then(r => r.text());
+              const cm = code.match(/client_id[:=]["']([a-zA-Z0-9]{32})["']/);
+              if (cm) { cid = cm[1]; break; }
+            } catch (_) {}
+          }
+          const full = pl.tracks.filter(t => t && t.title);
+          const missing = pl.tracks.filter(t => t && !t.title).map(t => t.id);
+          for (let i = 0; i < missing.length; i += 50) {
+            const chunk = missing.slice(i, i + 50);
+            try {
+              const u = `https://api-v2.soundcloud.com/tracks?ids=${chunk.join(',')}&client_id=${cid}`;
+              const items = await fetch(u, { headers: { 'User-Agent': 'Mozilla/5.0' } }).then(r => r.json());
+              if (Array.isArray(items)) full.push(...items);
+            } catch (_) {}
+          }
+          const tracks = full.map(t => ({
+            id: String(t.id),
+            title: t.title || 'untitled',
+            artist: (t.user && (t.user.username || t.user.name)) || 'unknown artist',
+            duration: Math.round((t.duration || t.full_duration || 0) / 1000),
+            thumbnail: t.artwork_url || (t.user && t.user.avatar_url) || '',
+            url: t.permalink_url || '',
+            platform: 'soundcloud',
+            isCached: false
+          }));
+          if (tracks.length > 0) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({
+              success: true,
+              name: pl.title || 'SoundCloud Playlist',
+              cover: pl.artwork_url || '',
+              tracks
+            }));
+          }
+        }
+      }
+    } catch (_) {}
+  }
   const args = [
     '--dump-single-json',
     '--no-warnings',
@@ -3407,7 +3730,50 @@ async function handlePlaylistImport(req, res, inputUrl) {
 }
 
 const SPOTIFY_SCOPES = 'user-library-read playlist-read-private playlist-read-collaborative';
-let spotifyAuth = { verifier: '', state: '', clientId: '', token: '' };
+let spotifyAuth = { verifier: '', state: '', clientId: '', token: '', refreshToken: '', expiresAt: 0 };
+let spotifyAuthError = '';
+let spotifyAuthLoaded = false;
+// shortcut: refreshes are serialized per process; coordinate through shared storage if concurrent app instances need the same Spotify session.
+let spotifyRefreshPromise = null;
+const spotifyAuthPath = path.join(DATA_DIR, 'spotify-auth.enc');
+const spotifySafeStorage = process.versions.electron ? require('electron').safeStorage : null;
+
+function canStoreSpotifyAuth() {
+  return spotifySafeStorage?.isEncryptionAvailable() &&
+    (process.platform !== 'linux' || spotifySafeStorage.getSelectedStorageBackend() !== 'basic_text');
+}
+
+function loadSpotifyAuth() {
+  if (spotifyAuthLoaded) return;
+  if (!canStoreSpotifyAuth()) return;
+  spotifyAuthLoaded = true;
+  try {
+    const saved = JSON.parse(spotifySafeStorage.decryptString(fs.readFileSync(spotifyAuthPath)));
+    if (/^[a-f0-9]{32}$/i.test(saved.clientId) && typeof saved.refreshToken === 'string' && saved.refreshToken) {
+      spotifyAuth = { ...spotifyAuth, clientId: saved.clientId, refreshToken: saved.refreshToken };
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') spotifyAuthError = 'Stored Spotify login could not be read. Please connect again.';
+  }
+}
+
+function saveSpotifyAuth() {
+  if (!canStoreSpotifyAuth()) return false;
+  const tmp = `${spotifyAuthPath}.tmp`;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(tmp, spotifySafeStorage.encryptString(JSON.stringify({ clientId: spotifyAuth.clientId, refreshToken: spotifyAuth.refreshToken })), { mode: 0o600 });
+    fs.renameSync(tmp, spotifyAuthPath);
+    return true;
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch (_) {}
+    return false;
+  }
+}
+
+function clearStoredSpotifyAuth() {
+  fs.rmSync(spotifyAuthPath, { force: true });
+}
 
 function getSpotifyRedirectUri() {
   const a = server.address();
@@ -3415,15 +3781,9 @@ function getSpotifyRedirectUri() {
   return `http://127.0.0.1:${port}/api/spotify-callback`;
 }
 
-function exchangeSpotifyCode(code, verifier, clientId, redirectUri) {
+function requestSpotifyToken(params) {
   return new Promise((resolve, reject) => {
-    const postData = new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: redirectUri,
-      client_id: clientId,
-      code_verifier: verifier
-    }).toString();
+    const postData = new URLSearchParams(params).toString();
 
     const req = https.request('https://accounts.spotify.com/api/token', {
       method: 'POST',
@@ -3451,9 +3811,52 @@ function exchangeSpotifyCode(code, verifier, clientId, redirectUri) {
   });
 }
 
+async function getSpotifyAccessToken(forceRefresh = false) {
+  loadSpotifyAuth();
+  if (!forceRefresh && spotifyAuth.token && (!spotifyAuth.expiresAt || Date.now() < spotifyAuth.expiresAt - 60000)) return spotifyAuth.token;
+  if (!spotifyAuth.refreshToken) throw new Error('Spotify session expired. Connect your account again.');
+  if (!spotifyRefreshPromise) {
+    spotifyRefreshPromise = (async () => {
+      const session = spotifyAuth;
+      let result;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          result = await requestSpotifyToken({ grant_type: 'refresh_token', refresh_token: session.refreshToken, client_id: session.clientId });
+        } catch (err) {
+          result = undefined;
+          if (attempt === 2) throw err;
+        }
+        if (result && result.status !== 429 && result.status < 500) break;
+        if (attempt < 2) await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+      }
+      if (spotifyAuth !== session) throw new Error('Spotify session changed. Try again.');
+      if (result.data?.error === 'invalid_grant') {
+        spotifyAuth.token = '';
+        spotifyAuth.refreshToken = '';
+        spotifyAuth.expiresAt = 0;
+        clearStoredSpotifyAuth();
+        throw new Error('Spotify login expired. Connect your account again.');
+      }
+      if (result.status !== 200 || typeof result.data?.access_token !== 'string' || !result.data.access_token || !Number.isFinite(result.data.expires_in) || result.data.expires_in <= 0) {
+        throw new Error(`Spotify token refresh failed (HTTP ${result.status}). Try again later.`);
+      }
+      spotifyAuth.token = result.data.access_token;
+      spotifyAuth.expiresAt = Date.now() + result.data.expires_in * 1000;
+      spotifyAuthError = '';
+      if (typeof result.data.refresh_token === 'string' && result.data.refresh_token) {
+        spotifyAuth.refreshToken = result.data.refresh_token;
+        if (!saveSpotifyAuth()) spotifyAuthError = 'Spotify login could not be saved securely; reconnect after restarting Riff.';
+      }
+      return spotifyAuth.token;
+    })().finally(() => { spotifyRefreshPromise = null; });
+  }
+  return spotifyRefreshPromise;
+}
+
 function spotifyApiGet(requestUrl, token) {
   return new Promise((resolve, reject) => {
     const u = new URL(requestUrl);
+    if (u.protocol !== 'https:' || u.hostname !== 'api.spotify.com') return reject(new Error('Invalid Spotify API URL'));
     const req = https.get(u, {
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -3472,18 +3875,46 @@ function spotifyApiGet(requestUrl, token) {
   });
 }
 
-async function spotifyGetWithRetry(requestUrl, token) {
+async function spotifyGetWithRetry(requestUrl) {
+  let token = await getSpotifyAccessToken();
   let resp = await spotifyApiGet(requestUrl, token);
-  if (resp.status === 429) {
-    const retryAfter = parseInt(resp.headers['retry-after'] || '1', 10);
-    await new Promise(r => setTimeout(r, Math.max(1, retryAfter) * 1000));
+  if (resp.status === 401 && spotifyAuth.refreshToken) {
+    token = await getSpotifyAccessToken(true);
+    resp = await spotifyApiGet(requestUrl, token);
+  }
+  for (let attempt = 0; resp.status === 429 && attempt < 3; attempt++) {
+    const retryAfter = spotifyRetryAfterSeconds(resp);
+    if (retryAfter > 30) return resp;
+    await new Promise(r => setTimeout(r, retryAfter * 1000));
     resp = await spotifyApiGet(requestUrl, token);
   }
   return resp;
 }
 
+function spotifyRetryAfterSeconds(resp) {
+  const raw = resp.headers?.['retry-after'];
+  const seconds = Number(raw);
+  if (raw !== undefined && Number.isFinite(seconds) && seconds >= 0) return seconds;
+  const date = Date.parse(raw);
+  return Number.isFinite(date) ? Math.max(0, (date - Date.now()) / 1000) : 1;
+}
+
+function spotifyApiFailure(resp, endpoint) {
+  let detail = '';
+  try {
+    const error = JSON.parse(resp.body).error;
+    detail = typeof error === 'string' ? error : (error?.message || '');
+  } catch (e) {}
+  const failure = new Error(resp.status === 429
+    ? 'Spotify rate limited the request. Try again later.'
+    : `Spotify ${endpoint} returned HTTP ${resp.status}${detail ? `: ${detail}` : ''}`);
+  failure.status = resp.status;
+  return failure;
+}
+
 async function handleSpotifyLibrary(req, res, query) {
-  if (!spotifyAuth.token) {
+  loadSpotifyAuth();
+  if (!spotifyAuth.token && !spotifyAuth.refreshToken) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ success: false, error: 'Unauthorized' }));
   }
@@ -3493,17 +3924,17 @@ async function handleSpotifyLibrary(req, res, query) {
 
   let likes = [];
   let playlists = [];
+  const skippedPlaylists = [];
 
   try {
     if (wantLikes) {
       let nextUrl = 'https://api.spotify.com/v1/me/tracks?limit=50';
       while (nextUrl && likes.length < 5000) {
-        const resp = await spotifyGetWithRetry(nextUrl, spotifyAuth.token);
-        if (resp.status === 403) throw new Error('SPOTIFY_403');
-        if (resp.status < 200 || resp.status >= 300) break;
-        let data = {};
-        try { data = JSON.parse(resp.body); } catch (e) { break; }
-        const items = Array.isArray(data.items) ? data.items : [];
+        const resp = await spotifyGetWithRetry(nextUrl);
+        if (resp.status < 200 || resp.status >= 300) throw spotifyApiFailure(resp, 'saved tracks');
+        const data = JSON.parse(resp.body);
+        if (!Array.isArray(data.items)) throw new Error('Invalid Spotify saved tracks response');
+        const items = data.items;
         for (const it of items) {
           const t = it?.item || it?.track;
           if (!t || t.is_local || t.type === 'episode') continue;
@@ -3521,12 +3952,11 @@ async function handleSpotifyLibrary(req, res, query) {
       let userPlaylists = [];
       let plNext = 'https://api.spotify.com/v1/me/playlists?limit=50';
       while (plNext) {
-        const resp = await spotifyGetWithRetry(plNext, spotifyAuth.token);
-        if (resp.status === 403) throw new Error('SPOTIFY_403');
-        if (resp.status < 200 || resp.status >= 300) break;
-        let data = {};
-        try { data = JSON.parse(resp.body); } catch (e) { break; }
-        const items = Array.isArray(data.items) ? data.items : [];
+        const resp = await spotifyGetWithRetry(plNext);
+        if (resp.status < 200 || resp.status >= 300) throw spotifyApiFailure(resp, 'playlists');
+        const data = JSON.parse(resp.body);
+        if (!Array.isArray(data.items)) throw new Error('Invalid Spotify playlists response');
+        const items = data.items;
         for (const pl of items) {
           if (pl && pl.id && pl.name) {
             userPlaylists.push({ id: pl.id, name: pl.name });
@@ -3535,22 +3965,44 @@ async function handleSpotifyLibrary(req, res, query) {
         plNext = data.next || null;
       }
 
-      for (const pl of userPlaylists) {
-        let plTracks = [];
+      playlistLoop: for (const pl of userPlaylists) {
+        const plTracks = [];
         let itemUrl = `https://api.spotify.com/v1/playlists/${encodeURIComponent(pl.id)}/items?limit=50`;
-        let resp = await spotifyGetWithRetry(itemUrl, spotifyAuth.token);
-        if (resp.status === 403) throw new Error('SPOTIFY_403');
+        let resp = await spotifyGetWithRetry(itemUrl);
         if (resp.status === 404 || resp.status === 400) {
           itemUrl = `https://api.spotify.com/v1/playlists/${encodeURIComponent(pl.id)}/tracks?limit=50`;
-          resp = await spotifyGetWithRetry(itemUrl, spotifyAuth.token);
-          if (resp.status === 403) throw new Error('SPOTIFY_403');
+          resp = await spotifyGetWithRetry(itemUrl);
         }
 
-        if (resp.status >= 200 && resp.status < 300) {
-          let pageData = {};
-          try { pageData = JSON.parse(resp.body); } catch (e) {}
-          const pageItems = Array.isArray(pageData.items) ? pageData.items : [];
-          for (const it of pageItems) {
+        if (resp.status === 403) {
+          skippedPlaylists.push({ name: pl.name, error: spotifyApiFailure(resp, `playlist items (${pl.name})`).message });
+          continue;
+        }
+        if (resp.status < 200 || resp.status >= 300) throw spotifyApiFailure(resp, `playlist items (${pl.name})`);
+
+        const pageData = JSON.parse(resp.body);
+        if (!Array.isArray(pageData.items)) throw new Error(`Invalid Spotify playlist items (${pl.name}) response`);
+        const pageItems = pageData.items;
+        for (const it of pageItems) {
+          const t = it?.item || it?.track;
+          if (!t || t.is_local || t.type === 'episode') continue;
+          const artist = (Array.isArray(t.artists) && t.artists[0]?.name) || '';
+          const title = t.name || '';
+          const duration = t.duration_ms ? Math.round(t.duration_ms / 1000) : undefined;
+          if (title) plTracks.push({ title, artist, duration });
+        }
+        let trackNext = pageData.next || null;
+        while (trackNext) {
+          const nextResp = await spotifyGetWithRetry(trackNext);
+          if (nextResp.status === 403) {
+            skippedPlaylists.push({ name: pl.name, error: spotifyApiFailure(nextResp, `playlist items (${pl.name})`).message });
+            continue playlistLoop;
+          }
+          if (nextResp.status < 200 || nextResp.status >= 300) throw spotifyApiFailure(nextResp, `playlist items (${pl.name})`);
+          const nextData = JSON.parse(nextResp.body);
+          if (!Array.isArray(nextData.items)) throw new Error(`Invalid Spotify playlist items (${pl.name}) response`);
+          const nextItems = nextData.items;
+          for (const it of nextItems) {
             const t = it?.item || it?.track;
             if (!t || t.is_local || t.type === 'episode') continue;
             const artist = (Array.isArray(t.artists) && t.artists[0]?.name) || '';
@@ -3558,40 +4010,16 @@ async function handleSpotifyLibrary(req, res, query) {
             const duration = t.duration_ms ? Math.round(t.duration_ms / 1000) : undefined;
             if (title) plTracks.push({ title, artist, duration });
           }
-          let trackNext = pageData.next || null;
-          while (trackNext) {
-            const nextResp = await spotifyGetWithRetry(trackNext, spotifyAuth.token);
-            if (nextResp.status === 403) throw new Error('SPOTIFY_403');
-            if (nextResp.status < 200 || nextResp.status >= 300) break;
-            let nextData = {};
-            try { nextData = JSON.parse(nextResp.body); } catch (e) { break; }
-            const nextItems = Array.isArray(nextData.items) ? nextData.items : [];
-            for (const it of nextItems) {
-              const t = it?.item || it?.track;
-              if (!t || t.is_local || t.type === 'episode') continue;
-              const artist = (Array.isArray(t.artists) && t.artists[0]?.name) || '';
-              const title = t.name || '';
-              const duration = t.duration_ms ? Math.round(t.duration_ms / 1000) : undefined;
-              if (title) plTracks.push({ title, artist, duration });
-            }
-            trackNext = nextData.next || null;
-          }
+          trackNext = nextData.next || null;
         }
         playlists.push({ name: pl.name, tracks: plTracks });
       }
     }
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true, likes, playlists }));
+    res.end(JSON.stringify({ success: true, partial: skippedPlaylists.length > 0, likes, playlists, skippedPlaylists }));
   } catch (err) {
-    if (err.message === 'SPOTIFY_403') {
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({
-        success: false,
-        error: 'Spotify refused access. In Development Mode your account must be added under "User Management" of your app.'
-      }));
-    }
-    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.writeHead(err.status === 403 ? 403 : err.status === 429 ? 429 : 500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: false, error: err.message }));
   }
 }
@@ -3690,6 +4118,16 @@ function setAlbumCache(key, data) {
   albumCache.set(key, { data, expires: Date.now() + 15 * 60 * 1000 });
 }
 
+// iTunes serves a different catalog per storefront; use the user's region when known.
+function itunesCountryParam() {
+  try {
+    const code = process.versions.electron ? require('electron').app.getLocaleCountryCode() : '';
+    return /^[A-Za-z]{2}$/.test(code) ? `&country=${code.toUpperCase()}` : '';
+  } catch (e) {
+    return '';
+  }
+}
+
 function fetchItunesJson(url) {
   return new Promise((resolve, reject) => {
     const req = https.get(url, {
@@ -3745,10 +4183,66 @@ async function handleAlbumSearch(req, res, parsedUrl) {
     return res.end(JSON.stringify(cached));
   }
 
+  const inFlight = albumCache.get(cacheKey);
+  if (inFlight?.promise) {
+    const outcome = await inFlight.promise;
+    res.writeHead(outcome.status, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(outcome.body));
+  }
+
+  let resolveSearch;
+  const searchPromise = new Promise(resolve => { resolveSearch = resolve; });
+  const inFlightEntry = { promise: searchPromise };
+  albumCache.set(cacheKey, inFlightEntry);
+  let outcome = null;
+  const sendResponse = (status, body) => {
+    outcome = { status, body };
+    resolveSearch(outcome);
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(body));
+  };
+
   try {
-    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&entity=album&media=music&limit=25`;
-    const data = await fetchItunesJson(url);
-    const results = (data && Array.isArray(data.results)) ? data.results : [];
+    const albumUrlMatch = q.match(/music\.apple\.com\/(?:[a-z]{2}\/)?album\/(?:[^/]+\/)?(\d+)/i);
+    if (albumUrlMatch) {
+      const data = await fetchItunesJson(`https://itunes.apple.com/lookup?id=${albumUrlMatch[1]}&entity=album${itunesCountryParam()}`);
+      const results = (data && Array.isArray(data.results)) ? data.results : [];
+      const item = results.find(r => r && r.wrapperType === 'collection');
+      if (item) {
+        const responseData = {
+          success: true,
+          albums: [{
+            id: String(item.collectionId),
+            title: item.collectionName || '',
+            artist: item.artistName || '',
+            year: item.releaseDate ? item.releaseDate.slice(0, 4) : '',
+            trackCount: item.trackCount || 0,
+            cover: (item.artworkUrl100 || '').replace('100x100', '600x600')
+          }]
+        };
+        setAlbumCache(cacheKey, responseData);
+        return sendResponse(200, responseData);
+      }
+    }
+
+    const cleanQ = q.replace(/\s+-\s+/g, ' ').replace(/\bby\b/gi, ' ').replace(/\s+/g, ' ').trim();
+    const urls = [
+      `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&entity=album&media=music&limit=25${itunesCountryParam()}`,
+      `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&limit=25${itunesCountryParam()}`
+    ];
+    if (cleanQ && cleanQ.toLowerCase() !== q.toLowerCase()) {
+      urls.push(`https://itunes.apple.com/search?term=${encodeURIComponent(cleanQ)}&entity=album&media=music&limit=25${itunesCountryParam()}`);
+      urls.push(`https://itunes.apple.com/search?term=${encodeURIComponent(cleanQ)}&media=music&limit=25${itunesCountryParam()}`);
+    }
+
+    const responses = await Promise.all(urls.map(u => fetchItunesJson(u).catch(() => null)));
+    const results = [];
+    for (const data of responses) {
+      if (data && Array.isArray(data.results)) {
+        results.push(...data.results);
+      }
+    }
+
     const albums = [];
     const seen = new Set();
     const normalize = (s) => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
@@ -3772,9 +4266,88 @@ async function handleAlbumSearch(req, res, parsedUrl) {
         trackCount: trackCount,
         cover: (item.artworkUrl100 || '').replace('100x100', '600x600')
       });
-
-      if (albums.length >= 12) break;
     }
+
+    const words = cleanQ.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 1);
+    const scoreAlbum = (album) => {
+      const title = (album.title || '').toLowerCase();
+      const artist = (album.artist || '').toLowerCase();
+      const full = title + ' ' + artist;
+      let score = 0;
+      for (const w of words) {
+        if (title.includes(w)) score += 15;
+        else if (artist.includes(w)) score += 10;
+      }
+      if (title === cleanQ.toLowerCase() || full === cleanQ.toLowerCase()) score += 50;
+      else if (full.includes(cleanQ.toLowerCase()) || cleanQ.toLowerCase().includes(title)) score += 25;
+      return score;
+    };
+
+    albums.sort((a, b) => scoreAlbum(b) - scoreAlbum(a));
+    const responseData = { success: true, albums: albums.slice(0, 12) };
+    setAlbumCache(cacheKey, responseData);
+    return sendResponse(200, responseData);
+  } catch (err) {
+    return sendResponse(502, { success: false, error: 'Album service unavailable' });
+  } finally {
+    if (!outcome) {
+      outcome = { status: 502, body: { success: false, error: 'Album service unavailable' } };
+      resolveSearch(outcome);
+    }
+    if (albumCache.get(cacheKey) === inFlightEntry) {
+      albumCache.delete(cacheKey);
+    }
+  }
+}
+
+async function handleArtistAlbums(req, res, parsedUrl) {
+  const name = (parsedUrl.query.name || '').trim();
+  if (!name) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ success: true, albums: [] }));
+  }
+  const cacheKey = `artist-albums:${name.toLowerCase()}`;
+  const cached = getAlbumCache(cacheKey);
+  if (cached) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(cached));
+  }
+  try {
+    const normalize = (s) => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    const target = normalize(name);
+    const artistSearch = await fetchItunesJson(`https://itunes.apple.com/search?term=${encodeURIComponent(name)}&entity=musicArtist&limit=10${itunesCountryParam()}`);
+    const artists = (artistSearch && Array.isArray(artistSearch.results)) ? artistSearch.results : [];
+    const best = artists.find(a => normalize(a.artistName) === target) || artists.find(a => normalize(a.artistName).includes(target) || target.includes(normalize(a.artistName))) || artists[0];
+    const albums = [];
+    const seen = new Set();
+    const addAlbum = (item) => {
+      if (!item || item.collectionId == null) return;
+      const title = item.collectionName || '';
+      if (/\s-\s*Single$/i.test(title)) return;
+      const normKey = normalize(title.replace(/\(.*?\)|\[.*?\]/g, ''));
+      if (seen.has(normKey)) return;
+      seen.add(normKey);
+      albums.push({
+        id: String(item.collectionId),
+        title,
+        artist: item.artistName || name,
+        year: item.releaseDate ? item.releaseDate.slice(0, 4) : '',
+        trackCount: item.trackCount || 0,
+        cover: (item.artworkUrl100 || '').replace('100x100', '600x600'),
+        date: item.releaseDate || ''
+      });
+    };
+    if (best && best.artistId != null) {
+      const lookup = await fetchItunesJson(`https://itunes.apple.com/lookup?id=${best.artistId}&entity=album&limit=200${itunesCountryParam()}`);
+      const items = (lookup && Array.isArray(lookup.results)) ? lookup.results : [];
+      items.filter(r => r && r.wrapperType === 'collection').forEach(addAlbum);
+    }
+    if (albums.length === 0) {
+      const fallback = await fetchItunesJson(`https://itunes.apple.com/search?term=${encodeURIComponent(name)}&entity=album&attribute=artistTerm&limit=200${itunesCountryParam()}`);
+      const items = (fallback && Array.isArray(fallback.results)) ? fallback.results : [];
+      items.filter(r => r && normalize(r.artistName).includes(target)).forEach(addAlbum);
+    }
+    albums.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
     const responseData = { success: true, albums };
     setAlbumCache(cacheKey, responseData);
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3815,14 +4388,32 @@ async function handleAlbumTracks(req, res, parsedUrl) {
     return res.end(JSON.stringify(cached));
   }
 
+  const inFlight = albumCache.get(cacheKey);
+  if (inFlight?.promise) {
+    const outcome = await inFlight.promise;
+    res.writeHead(outcome.status, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(outcome.body));
+  }
+
+  let resolveLookup;
+  const lookupPromise = new Promise(resolve => { resolveLookup = resolve; });
+  const inFlightEntry = { promise: lookupPromise };
+  albumCache.set(cacheKey, inFlightEntry);
+  let outcome = null;
+  const sendResponse = (status, body) => {
+    outcome = { status, body };
+    resolveLookup(outcome);
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(body));
+  };
+
   try {
-    const url = `https://itunes.apple.com/lookup?id=${id}&entity=song`;
+    const url = `https://itunes.apple.com/lookup?id=${id}&entity=song${itunesCountryParam()}`;
     const data = await fetchItunesJson(url);
     const results = (data && Array.isArray(data.results)) ? data.results : [];
     const albumItem = results.find(r => r && r.wrapperType === 'collection');
     if (!albumItem) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: false, error: 'Album not found' }));
+      return sendResponse(404, { success: false, error: 'Album not found' });
     }
     const album = {
       id: String(albumItem.collectionId),
@@ -3845,11 +4436,17 @@ async function handleAlbumTracks(req, res, parsedUrl) {
 
     const responseData = { success: true, album, tracks };
     setAlbumCache(cacheKey, responseData);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(responseData));
+    return sendResponse(200, responseData);
   } catch (err) {
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ success: false, error: 'Album service unavailable' }));
+    return sendResponse(502, { success: false, error: 'Album service unavailable' });
+  } finally {
+    if (!outcome) {
+      outcome = { status: 502, body: { success: false, error: 'Album service unavailable' } };
+      resolveLookup(outcome);
+    }
+    if (albumCache.get(cacheKey) === inFlightEntry) {
+      albumCache.delete(cacheKey);
+    }
   }
 }
 
@@ -3857,6 +4454,16 @@ let hotPicksCache = { data: null, expires: 0 };
 
 async function handleHotPicks(req, res, parsedUrl) {
   const limit = Math.max(1, Math.min(25, parseInt(parsedUrl.query.limit || '12', 10) || 12));
+
+  if (hotPicksCache.promise) {
+    const outcome = await hotPicksCache.promise;
+    res.writeHead(outcome.status, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(outcome.body.success ? {
+      success: true,
+      title: outcome.body.title,
+      tracks: outcome.body.tracks.slice(0, limit)
+    } : outcome.body));
+  }
 
   if (hotPicksCache.data && Date.now() < hotPicksCache.expires) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3867,16 +4474,25 @@ async function handleHotPicks(req, res, parsedUrl) {
     }));
   }
 
+  let resolveLookup;
+  const lookupPromise = new Promise(resolve => { resolveLookup = resolve; });
+  hotPicksCache = { data: null, expires: 0, promise: lookupPromise };
+  let outcome = null;
+  const sendResponse = (status, body) => {
+    outcome = { status, body };
+    resolveLookup(outcome);
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(body));
+  };
+
   try {
     const data = await fetchItunesJson('https://api.deezer.com/chart/0/tracks?limit=40');
     const rawItems = (data && Array.isArray(data.data)) ? data.data : [];
     const candidates = rawItems
       .filter(item => item && item.title && item.artist && item.artist.name)
       .map(item => ({ artist: item.artist.name, title: item.title }));
-
     if (candidates.length === 0) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: false }));
+      return sendResponse(200, { success: false });
     }
 
     const resolvedTracks = [];
@@ -3902,8 +4518,7 @@ async function handleHotPicks(req, res, parsedUrl) {
     await Promise.all([worker(), worker(), worker(), worker()]);
 
     if (resolvedTracks.length === 0) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: false }));
+      return sendResponse(200, { success: false });
     }
 
     const title = 'Hot picks ' + new Date().getFullYear();
@@ -3912,15 +4527,21 @@ async function handleHotPicks(req, res, parsedUrl) {
       expires: Date.now() + 60 * 60 * 1000
     };
 
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
+    return sendResponse(200, {
       success: true,
       title,
-      tracks: resolvedTracks.slice(0, limit)
-    }));
+      tracks: resolvedTracks
+    });
   } catch (err) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ success: false }));
+    return sendResponse(200, { success: false });
+  } finally {
+    if (!outcome) {
+      outcome = { status: 200, body: { success: false } };
+      resolveLookup(outcome);
+    }
+    if (hotPicksCache.promise === lookupPromise) {
+      hotPicksCache = { data: null, expires: 0 };
+    }
   }
 }
 
@@ -4059,6 +4680,10 @@ const server = http.createServer(async (req, res) => {
     return handleAlbumSearch(req, res, parsedUrl);
   }
 
+  if (parsedUrl.pathname === '/api/artist-albums') {
+    return handleArtistAlbums(req, res, parsedUrl);
+  }
+
   if (parsedUrl.pathname === '/api/albums/tracks') {
     return handleAlbumTracks(req, res, parsedUrl);
   }
@@ -4068,6 +4693,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (parsedUrl.pathname === '/api/spotify-auth-start') {
+    loadSpotifyAuth();
+    spotifyAuthLoaded = true;
     const clientId = parsedUrl.query.clientId || '';
     if (!/^[a-f0-9]{32}$/i.test(clientId)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -4076,7 +4703,8 @@ const server = http.createServer(async (req, res) => {
     const verifier = crypto.randomBytes(48).toString('base64url');
     const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
     const state = crypto.randomBytes(16).toString('hex');
-    spotifyAuth = { verifier, state, clientId, token: '' };
+    spotifyAuth = { verifier, state, clientId, token: '', refreshToken: '', expiresAt: 0 };
+    spotifyAuthError = '';
     const redirectUri = getSpotifyRedirectUri();
     const authUrl = `https://accounts.spotify.com/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&scope=${encodeURIComponent(SPOTIFY_SCOPES)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}&code_challenge_method=S256&code_challenge=${encodeURIComponent(challenge)}`;
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -4087,34 +4715,65 @@ const server = http.createServer(async (req, res) => {
     const code = parsedUrl.query.code;
     const state = parsedUrl.query.state;
     const errParam = parsedUrl.query.error;
-    if (errParam || !state || state !== spotifyAuth.state || !code) {
+    if (!spotifyAuth.state || !state || state !== spotifyAuth.state) {
       res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end('<!DOCTYPE html><html><body><p>Login failed, you can close this tab.</p></body></html>');
+      return res.end('<!DOCTYPE html><html><body><p>Invalid Spotify login session.</p></body></html>');
+    }
+    if (errParam || !code) {
+      spotifyAuthError = errParam === 'access_denied' ? 'Spotify authorization was denied.' : 'Spotify login failed. Check the Client ID, allowed account and redirect URI.';
+      spotifyAuth.state = '';
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end('<!DOCTYPE html><html><body><p>Spotify login failed. Return to Riff for details.</p></body></html>');
     }
     const redirectUri = getSpotifyRedirectUri();
     try {
-      const tokenResult = await exchangeSpotifyCode(code, spotifyAuth.verifier, spotifyAuth.clientId, redirectUri);
-      if (tokenResult.status >= 200 && tokenResult.status < 300 && tokenResult.data && tokenResult.data.access_token) {
+      const session = spotifyAuth;
+      const tokenResult = await requestSpotifyToken({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: spotifyAuth.clientId, code_verifier: spotifyAuth.verifier });
+      if (spotifyAuth !== session) {
+        res.writeHead(409, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end('<!DOCTYPE html><html><body><p>Spotify login session changed. Return to Riff and try again.</p></body></html>');
+      }
+      spotifyAuth.state = '';
+      if (tokenResult.status >= 200 && tokenResult.status < 300 && typeof tokenResult.data?.access_token === 'string' && tokenResult.data.access_token) {
         spotifyAuth.token = tokenResult.data.access_token;
+        spotifyAuth.refreshToken = typeof tokenResult.data.refresh_token === 'string' ? tokenResult.data.refresh_token : '';
+        spotifyAuth.expiresAt = Date.now() + (Number.isFinite(tokenResult.data.expires_in) && tokenResult.data.expires_in > 0 ? tokenResult.data.expires_in : 3600) * 1000;
+        if (!spotifyAuth.refreshToken) spotifyAuthError = 'Spotify did not provide a refresh token; reconnect when this session expires.';
+        else if (!saveSpotifyAuth()) spotifyAuthError = 'Spotify login could not be saved securely; reconnect after restarting Riff.';
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end('<!DOCTYPE html><html><body><p>Riff is connected to Spotify. You can close this tab.</p></body></html>');
       } else {
+        const reason = tokenResult.data?.error_description || tokenResult.data?.error || `HTTP ${tokenResult.status}`;
+        spotifyAuthError = `Spotify token exchange failed: ${reason}`;
         res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        return res.end('<!DOCTYPE html><html><body><p>Login failed, you can close this tab.</p></body></html>');
+        return res.end('<!DOCTYPE html><html><body><p>Spotify login failed. Return to Riff for details.</p></body></html>');
       }
     } catch (err) {
+      spotifyAuth.state = '';
+      spotifyAuthError = `Could not reach Spotify: ${err.message}`;
       res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end('<!DOCTYPE html><html><body><p>Login failed, you can close this tab.</p></body></html>');
+      return res.end('<!DOCTYPE html><html><body><p>Spotify login failed. Return to Riff for details.</p></body></html>');
     }
   }
 
   if (parsedUrl.pathname === '/api/spotify-status') {
+    loadSpotifyAuth();
+    if (spotifyAuth.refreshToken) {
+      try { await getSpotifyAccessToken(); }
+      catch (e) { spotifyAuthError = e.message; }
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ connected: Boolean(spotifyAuth.token) }));
+    return res.end(JSON.stringify({ connected: Boolean(spotifyAuth.token && (!spotifyAuth.expiresAt || Date.now() < spotifyAuth.expiresAt)), error: spotifyAuthError }));
   }
 
   if (parsedUrl.pathname === '/api/spotify-logout') {
-    spotifyAuth.token = '';
+    try { clearStoredSpotifyAuth(); }
+    catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: false, error: 'Could not remove saved Spotify login' }));
+    }
+    spotifyAuth = { verifier: '', state: '', clientId: '', token: '', refreshToken: '', expiresAt: 0 };
+    spotifyAuthError = '';
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ success: true }));
   }
@@ -4287,18 +4946,22 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (parsedUrl.pathname === '/api/library') {
-    const list = Object.values(libraryIndex)
-      .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
-      .map(item => ({
+    const items = Object.values(libraryIndex).sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+    queueLocalCovers(items.map(item => item.id));
+    const list = items.map(item => ({
         id: item.id,
         platform: 'local',
         title: item.title,
         artist: item.artist,
         duration: Number(item.duration) || 0,
-        thumbnail: ''
+        thumbnail: fs.existsSync(localCoverPath(item.id)) ? `http://127.0.0.1:${PORT}/api/local-cover?id=${encodeURIComponent(item.id)}` : ''
       }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify(list));
+  }
+
+  if (parsedUrl.pathname === '/api/local-cover') {
+    return handleLocalCover(req, res, parsedUrl);
   }
 
   if (parsedUrl.pathname === '/api/library-file') {
@@ -4466,9 +5129,11 @@ function startServer(port = PORT) {
   }
   return new Promise((resolve, reject) => {
     server.listen(port, '127.0.0.1', () => {
-      console.log(`devsize internal server running on http://127.0.0.1:${port}`);
+      const address = server.address();
+      const bound = address && typeof address === 'object' ? address.port : port;
+      console.log(`devsize internal server running on http://127.0.0.1:${bound}`);
       require('./tools').updateYtDlpIfManaged().catch(() => {});
-      resolve(port);
+      resolve(bound);
     }).on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
         server.listen(0, '127.0.0.1', () => {
@@ -4484,7 +5149,15 @@ function startServer(port = PORT) {
   });
 }
 
-module.exports = { startServer, PORT, getServerToken };
+function stopServer() {
+  return new Promise((resolve) => {
+    if (!server.listening) return resolve();
+    server.close(() => resolve());
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+  });
+}
+
+module.exports = { startServer, stopServer, PORT, getServerToken };
 
 if (require.main === module) {
   startServer();
