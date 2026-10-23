@@ -19,8 +19,8 @@ android {
         applicationId = "io.github.skibididobdob228.riffspotify"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "42.3.0-spotify.1"
+        versionCode = 2
+        versionName = "42.3.0-spotify.2"
         externalNativeBuild {
             cmake {
                 arguments += listOf("-DANDROID_STL=c++_shared")

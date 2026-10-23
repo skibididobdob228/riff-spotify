@@ -186,6 +186,15 @@
     },
     // Back button: the now-playing sheet first, then Riff's Escape handling (dialogs, detail views), then home, then leave the app
     back() {
+      // Riff closes these on Escape or with their own button, without marking the key as handled
+      if (document.querySelector('.track-context-menu')) {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+        return;
+      }
+      if (document.body.classList.contains('multi-select-on')) {
+        document.getElementById('multi-select-done')?.click();
+        return;
+      }
       if (isPhone() && nowPlayingOpen()) {
         document.getElementById('btn-close-right-panel')?.click();
         return;
