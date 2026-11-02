@@ -1523,21 +1523,29 @@ async function handleSearch(req, res, query, platform = 'youtube', limit = 20) {
   try {
   if (platform === 'spotify') {
     try {
-      const tracks = await spotifyEngine.search(query, limit);
+      const { tracks, artist } = await spotifyEngine.searchAll(query, limit);
       const entries = await Promise.all(tracks.map(async (t) => ({ ...t, isCached: !!(await findCachedFile(t.id)) })));
-      const result = { success: true, tracks: entries };
-      if (entries.length) searchCache.set(cacheKey, result);
-      const first = entries[0];
-      if (first) {
-        setTimeout(() => {
-          spotifyEngine.resolveAudio(first.id.replace(/^sp_/, ''), first)
-            .then((videoId) => { if (videoId) prefetchTrack(`https://www.youtube.com/watch?v=${videoId}`, first.id, 'youtube'); })
-            .catch(() => {});
-        }, 60);
+      const result = { success: true, tracks: entries, artist };
+      if (entries.length) {
+        searchCache.set(cacheKey, result);
+        setTimeout(() => { if (searchCache.get(cacheKey) === result) searchCache.delete(cacheKey); }, 300000);
       }
+      // Find the YouTube audio of the top results now, so the first click plays without a lookup;
+      // one at a time to stay gentle on YouTube Music, and only the first one gets its stream prefetched
+      setTimeout(async () => {
+        for (const t of entries.slice(0, 3)) {
+          if (t.isCached) continue;
+          const videoId = await spotifyEngine.resolveAudio(t.id.replace(/^sp_/, ''), t).catch(() => null);
+          if (videoId && t === entries[0]) prefetchTrack(`https://www.youtube.com/watch?v=${videoId}`, t.id, 'youtube').catch(() => {});
+        }
+      }, 60);
       return sendResponse(200, result);
     } catch (err) {
       try { logger.log('error', `spotify search failed: ${err.message}`); } catch (_) {}
+      // Spotify down or blocked: YouTube Music results still play, so show those instead of nothing
+      let fallback = await searchYtmTracks(query, limit).catch(() => []);
+      if (!fallback.length) fallback = ((await directYoutubeSearch(query).catch(() => [])) || []).slice(0, limit);
+      if (fallback.length) return sendResponse(200, { success: true, tracks: fallback, fallback: 'youtube' });
       return sendResponse(200, { success: false, tracks: [], error: 'Spotify search is unavailable' });
     }
   }
@@ -1781,6 +1789,9 @@ async function handleVibeRecommendations(req, res, payload) {
   }
 }
 
+// yt-dlp messages for a YouTube video that will never play again
+const YT_GONE_RE = /video unavailable|private video|has been removed|no longer available|account associated with this video has been terminated|copyright claim/i;
+
 async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube', title = '', artist = '', duration = 0, thumbnail = '') {
   // Only a confident Spotify match goes to the disk cache; a weak or missing one is retried on the next play
   let diskCacheOk = true;
@@ -1861,6 +1872,23 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
       if (lines.length > 0) streamUrl = lines[0];
     } catch (e) {
       try { logger.error('Stream resolve primary error: ' + (title || trackUrl), e); } catch (_) {}
+      // The remembered YouTube video for this Spotify track is gone: forget it and pick another one.
+      // Only for "video unavailable" errors, so a broken yt-dlp or network never wipes good matches.
+      const deadId = spId && spotifyEngine.knownMatch(spId);
+      if (deadId && trackUrl.includes(deadId) && YT_GONE_RE.test(String(e && e.message))) {
+        spotifyEngine.forgetMatch(spId);
+        const nextId = await spotifyEngine.resolveAudio(spId, { title, artist, duration }, [deadId]);
+        if (nextId) {
+          trackUrl = `https://www.youtube.com/watch?v=${nextId}`;
+          diskCacheOk = !!spotifyEngine.knownMatch(spId);
+          try {
+            const raw = await executeYtDlp(['--no-config', '-g', '--no-warnings', '--no-playlist', '--no-check-certificates', '--prefer-free-formats', '-f', 'bestaudio/best', '--extractor-args', 'youtube:player_client=android', '--', trackUrl], 18000);
+            streamUrl = raw.trim().split('\n').map(l => l.trim()).find(l => l.startsWith('http')) || null;
+          } catch (e2) {
+            try { logger.error('Stream resolve retry error: ' + (title || trackUrl), e2); } catch (_) {}
+          }
+        }
+      }
     }
   }
 
