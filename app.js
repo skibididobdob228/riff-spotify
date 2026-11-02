@@ -6630,7 +6630,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Fills the artist page from Spotify; false means fall back to the YouTube profile
-  async function renderSpotifyArtist(lookup, heroCard) {
+  async function renderSpotifyArtist(lookup, heroCard, isCurrent = () => true) {
     let data;
     const q = lookup.id ? `id=${encodeURIComponent(lookup.id)}` : `name=${encodeURIComponent(lookup.name)}`;
     // One retry: the first Spotify call after start also fetches a token and may be slow to come back
@@ -6643,7 +6643,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         data = null;
       }
     }
-    if (!data || !data.success || !data.artist || state.currentView !== 'artist') return false;
+    if (!isCurrent() || !data || !data.success || !data.artist || state.currentView !== 'artist') return false;
     const a = data.artist;
     rememberSpotifyArtists(a.tracks);
     state.currentArtistData = a;
@@ -6681,7 +6681,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
     if (a.avatar) {
       getCoverDominantColors(a.avatar).then(([domColor]) => {
-        if (state.currentView === 'artist') setAccent(domColor || 'var(--md-sys-color-primary-container)');
+        if (isCurrent()) setAccent(domColor || 'var(--md-sys-color-primary-container)');
       }).catch(() => setAccent('var(--md-sys-color-primary-container)'));
     } else {
       setAccent('var(--md-sys-color-primary-container)');
@@ -6750,6 +6750,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   async function openArtistProfile(artistName) {
     if (!artistName || !artistName.trim()) return;
     let cleanName = artistName.replace(/ - Topic|VEVO|Official|Records/gi, '').trim();
+    // A newer openArtistProfile call owns the page; slow responses for an older artist are dropped
+    const openToken = (state.artistOpenToken || 0) + 1;
+    state.artistOpenToken = openToken;
+    const isCurrent = () => state.artistOpenToken === openToken && state.currentView === 'artist';
 
     state.previousView = state.currentView;
     switchView('artist');
@@ -6784,7 +6788,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const spotifyArtist = findSpotifyArtist(artistName);
     if (spotifyArtist) {
-      if (await renderSpotifyArtist(spotifyArtist, heroCard)) return;
+      if (await renderSpotifyArtist(spotifyArtist, heroCard, isCurrent)) return;
+      if (!isCurrent()) return;
       // Spotify tracks list every artist ("A, B, C"); the fallback profile is for the main one
       cleanName = cleanName.split(',')[0].trim();
       if (el.artistProfileName) el.artistProfileName.textContent = cleanName;
@@ -6810,6 +6815,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/artist?name=${encodeURIComponent(cleanName)}`, { signal: bioController.signal });
       clearTimeout(bioTimeout);
       const data = await res.json();
+      if (!isCurrent()) return;
 
       if (!data.success || !data.artist) throw new Error('Artist not found');
 
@@ -6848,7 +6854,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         getCoverDominantColors(data.artist.avatar).then(([domColor]) => {
-          if (state.currentView === 'artist' && heroCard) {
+          if (isCurrent() && heroCard) {
             const c = domColor || 'var(--md-sys-color-primary-container)';
             heroCard.style.setProperty('--artist-accent-color', c);
             document.documentElement.style.setProperty('--artist-accent-color', c);
@@ -6871,6 +6877,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     } catch (e) {
       clearTimeout(bioTimeout);
+      if (!isCurrent()) return;
       console.warn('Artist load error:', e);
       if (el.artistHeroBackdrop) el.artistHeroBackdrop.style.backgroundImage = '';
       if (heroCard) heroCard.style.setProperty('--artist-accent-color', 'var(--md-sys-color-primary-container)');

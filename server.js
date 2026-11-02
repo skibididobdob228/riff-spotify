@@ -1782,9 +1782,13 @@ async function handleVibeRecommendations(req, res, payload) {
 }
 
 async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube', title = '', artist = '', duration = 0, thumbnail = '') {
-  if (spotifyEngine.idFromUrl(trackUrl)) {
+  // Only a confident Spotify match goes to the disk cache; a weak or missing one is retried on the next play
+  let diskCacheOk = true;
+  const spId = spotifyEngine.idFromUrl(trackUrl);
+  if (spId) {
     trackUrl = await resolveSpotifyTrackUrl(trackUrl, { title, artist, duration });
     if (trackUrl) platform = 'youtube';
+    diskCacheOk = !!trackUrl && !!spotifyEngine.knownMatch(spId);
   }
   let cleanId = cleanTrackId(trackId);
   if (!cleanId && trackUrl && trackUrl.includes('v=')) {
@@ -1828,7 +1832,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
     }
     if (cached && (Date.now() - cached.timestamp < 1800000)) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      if (cleanId) setTimeout(() => downloadTrackToDisk(trackUrl, cleanId, platform, meta), 10000);
+      if (cleanId && diskCacheOk) setTimeout(() => downloadTrackToDisk(trackUrl, cleanId, platform, meta), 10000);
       return res.end(JSON.stringify(cached.data));
     }
   }
@@ -1895,7 +1899,7 @@ async function handleStreamInfo(req, res, trackUrl, trackId, platform = 'youtube
   resolveLookup(data);
   if (cacheKey) streamUrlCache.set(cacheKey, { timestamp: Date.now(), data });
   if (cleanId && cleanId !== cacheKey) streamUrlCache.set(cleanId, { timestamp: Date.now(), data });
-  if (cleanId) setTimeout(() => downloadTrackToDisk(trackUrl, cleanId, platform, meta), 10000);
+  if (cleanId && diskCacheOk) setTimeout(() => downloadTrackToDisk(trackUrl, cleanId, platform, meta), 10000);
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(data));
