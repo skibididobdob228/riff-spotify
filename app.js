@@ -5649,30 +5649,39 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
       }
 
-      const avatarUrl = artist.avatar || (searchTracks && searchTracks[0] ? searchTracks[0].thumbnail : '');
-      container.innerHTML = `
-        <div class="search-artist-card" role="button" tabindex="0">
-          <div class="search-artist-avatar-wrap">
-            ${avatarUrl ? `<img class="search-artist-avatar" src="${escapeHtml(avatarUrl)}" alt="${escapeHtml(artist.name)}" />` : '<div style="width:100%;height:100%;background:var(--md-sys-color-surface-container);"></div>'}
-          </div>
-          <div class="search-artist-info">
-            <span class="search-artist-name">${escapeHtml(artist.name)}</span>
-            <span class="search-artist-label">Artist</span>
-          </div>
-        </div>
-      `;
-
-      const card = container.querySelector('.search-artist-card');
-      if (card) {
-        card.addEventListener('click', () => openArtistProfile(artist.name));
-        card.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            openArtistProfile(artist.name);
-          }
-        });
-      }
+      renderSearchArtistCard(artist, searchTracks);
     } catch (e) {}
+  }
+
+  // spotifyId: open the Spotify profile by id, so a namesake never gets in the way
+  function renderSearchArtistCard(artist, searchTracks, spotifyId) {
+    const container = document.getElementById('search-artist-card-container');
+    if (!container || !artist || !artist.name) return;
+    if (spotifyId) spotifyArtistIds.set(artist.name.toLowerCase(), spotifyId);
+    const open = () => openArtistProfile(artist.name, spotifyId);
+    const avatarUrl = artist.avatar || (searchTracks && searchTracks[0] ? searchTracks[0].thumbnail : '');
+    container.innerHTML = `
+      <div class="search-artist-card" role="button" tabindex="0">
+        <div class="search-artist-avatar-wrap">
+          ${avatarUrl ? `<img class="search-artist-avatar" src="${escapeHtml(avatarUrl)}" alt="${escapeHtml(artist.name)}" />` : '<div style="width:100%;height:100%;background:var(--md-sys-color-surface-container);"></div>'}
+        </div>
+        <div class="search-artist-info">
+          <span class="search-artist-name">${escapeHtml(artist.name)}</span>
+          <span class="search-artist-label">Artist</span>
+        </div>
+      </div>
+    `;
+
+    const card = container.querySelector('.search-artist-card');
+    if (card) {
+      card.addEventListener('click', open);
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          open();
+        }
+      });
+    }
   }
 
   const albumResolved = new Map();
@@ -5858,7 +5867,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     const titleEl = document.getElementById('album-detail-title');
-    if (titleEl) titleEl.textContent = album.title || 'Untitled album';
+    if (titleEl) titleEl.textContent = album.title || (album.fromLink ? 'Loading…' : 'Untitled album');
 
     const artistBtn = document.getElementById('album-detail-artist');
     if (artistBtn) {
@@ -5917,6 +5926,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       const tracks = data.tracks;
+      // Opened from a pasted link: the header only learns the title and cover now
+      if (data.album && album.fromLink) {
+        Object.assign(album, { title: data.album.title, cover: data.album.cover, year: data.album.year });
+        if (titleEl) titleEl.textContent = album.title || 'Untitled album';
+        if (coverEl && album.cover) {
+          coverEl.innerHTML = `<img src="${escapeHtml(album.cover)}" alt="${escapeHtml(album.title)}" style="width:100%;height:100%;aspect-ratio:1;border-radius:20px;object-fit:cover;box-shadow:none;" />`;
+        }
+        if (albumHeroFx && album.cover) albumHeroFx.style.backgroundImage = `url("${album.cover}")`;
+      }
       const albumArtist = (data.album && data.album.artist) || album.artist || '';
       const albumYear = (data.album && data.album.year) || album.year || '';
 
@@ -6092,8 +6110,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  // Placeholder name for an artist opened from a link; Spotify fills in the real one
+  const SPOTIFY_LINK_ARTIST = 'Spotify artist';
+
+  // open.spotify.com album/artist links (any engine) open the page itself instead of a text search
+  function openSpotifyLink(text) {
+    const m = String(text || '').trim().match(/^(?:https?:\/\/)?open\.spotify\.com\/(?:intl-[\w-]+\/)?(album|artist)\/([A-Za-z0-9]{22})(?:[/?#]|$)/)
+      || String(text || '').trim().match(/^spotify:(album|artist):([A-Za-z0-9]{22})$/);
+    if (!m) return false;
+    if (m[1] === 'album') openAlbum({ id: `sp_${m[2]}`, title: '', artist: '', cover: '', fromLink: true });
+    else openArtistProfile(SPOTIFY_LINK_ARTIST, m[2]);
+    return true;
+  }
+
   async function performSearch(query) {
     if (!query || !query.trim()) return;
+    if (openSpotifyLink(query)) return;
 
     const searchToken = (state.searchToken || 0) + 1;
     state.searchToken = searchToken;
@@ -6140,6 +6172,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       state.searchResults = data.tracks;
       rememberSpotifyArtists(data.tracks);
+      if (data.fallback) showToast('Spotify is unavailable, showing YouTube results');
 
       requestAnimationFrame(() => {
         if (el.searchTracksList) renderTracks(el.searchTracksList, data.tracks, 'search');
@@ -6147,7 +6180,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const showArtists = localStorage.getItem('riff_search_artists') !== '0';
       const trimmedQuery = query.trim();
-      if (showArtists && trimmedQuery.length >= 3) {
+      if (showArtists && data.artist && data.artist.id) {
+        renderSearchArtistCard(data.artist, data.tracks, data.artist.id);
+      } else if (showArtists && trimmedQuery.length >= 3 && !(state.platform === 'spotify' && !data.fallback)) {
+        // Spotify already said which artist (if any) the query is about; other engines ask Deezer
         fetchArtistCardForSearch(trimmedQuery, searchToken, data.tracks);
       }
     } catch (err) {
@@ -6630,7 +6666,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // Fills the artist page from Spotify; false means fall back to the YouTube profile
-  async function renderSpotifyArtist(lookup, heroCard) {
+  async function renderSpotifyArtist(lookup, heroCard, isCurrent = () => true) {
     let data;
     const q = lookup.id ? `id=${encodeURIComponent(lookup.id)}` : `name=${encodeURIComponent(lookup.name)}`;
     // One retry: the first Spotify call after start also fetches a token and may be slow to come back
@@ -6643,7 +6679,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         data = null;
       }
     }
-    if (!data || !data.success || !data.artist || state.currentView !== 'artist') return false;
+    if (!isCurrent() || !data || !data.success || !data.artist || state.currentView !== 'artist') return false;
     const a = data.artist;
     rememberSpotifyArtists(a.tracks);
     state.currentArtistData = a;
@@ -6681,7 +6717,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
     if (a.avatar) {
       getCoverDominantColors(a.avatar).then(([domColor]) => {
-        if (state.currentView === 'artist') setAccent(domColor || 'var(--md-sys-color-primary-container)');
+        if (isCurrent()) setAccent(domColor || 'var(--md-sys-color-primary-container)');
       }).catch(() => setAccent('var(--md-sys-color-primary-container)'));
     } else {
       setAccent('var(--md-sys-color-primary-container)');
@@ -6747,9 +6783,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch (e) {}
   }
 
-  async function openArtistProfile(artistName) {
+  async function openArtistProfile(artistName, spotifyId) {
     if (!artistName || !artistName.trim()) return;
     let cleanName = artistName.replace(/ - Topic|VEVO|Official|Records/gi, '').trim();
+    // A newer openArtistProfile call owns the page; slow responses for an older artist are dropped
+    const openToken = (state.artistOpenToken || 0) + 1;
+    state.artistOpenToken = openToken;
+    const isCurrent = () => state.artistOpenToken === openToken && state.currentView === 'artist';
 
     state.previousView = state.currentView;
     switchView('artist');
@@ -6782,9 +6822,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     const itunesAlbums = document.getElementById('artist-albums-section');
     if (itunesAlbums) itunesAlbums.style.display = 'none';
 
-    const spotifyArtist = findSpotifyArtist(artistName);
+    const spotifyArtist = spotifyId ? { id: spotifyId } : findSpotifyArtist(artistName);
     if (spotifyArtist) {
-      if (await renderSpotifyArtist(spotifyArtist, heroCard)) return;
+      if (await renderSpotifyArtist(spotifyArtist, heroCard, isCurrent)) return;
+      if (!isCurrent()) return;
+      if (spotifyId && artistName === SPOTIFY_LINK_ARTIST) {
+        // Only the id is known, so there is no name for a YouTube fallback profile
+        if (el.artistTracksCount) el.artistTracksCount.textContent = '';
+        if (wrap) wrap.classList.remove('loading');
+        if (el.artistTracksList) el.artistTracksList.innerHTML = '<div class="empty-hint">Could not load this Spotify artist. Try again later.</div>';
+        return;
+      }
       // Spotify tracks list every artist ("A, B, C"); the fallback profile is for the main one
       cleanName = cleanName.split(',')[0].trim();
       if (el.artistProfileName) el.artistProfileName.textContent = cleanName;
@@ -6810,6 +6858,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const res = await fetch(`http://127.0.0.1:${state.serverPort}/api/artist?name=${encodeURIComponent(cleanName)}`, { signal: bioController.signal });
       clearTimeout(bioTimeout);
       const data = await res.json();
+      if (!isCurrent()) return;
 
       if (!data.success || !data.artist) throw new Error('Artist not found');
 
@@ -6848,7 +6897,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         getCoverDominantColors(data.artist.avatar).then(([domColor]) => {
-          if (state.currentView === 'artist' && heroCard) {
+          if (isCurrent() && heroCard) {
             const c = domColor || 'var(--md-sys-color-primary-container)';
             heroCard.style.setProperty('--artist-accent-color', c);
             document.documentElement.style.setProperty('--artist-accent-color', c);
@@ -6871,6 +6920,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     } catch (e) {
       clearTimeout(bioTimeout);
+      if (!isCurrent()) return;
       console.warn('Artist load error:', e);
       if (el.artistHeroBackdrop) el.artistHeroBackdrop.style.backgroundImage = '';
       if (heroCard) heroCard.style.setProperty('--artist-accent-color', 'var(--md-sys-color-primary-container)');

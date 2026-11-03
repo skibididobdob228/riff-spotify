@@ -26,11 +26,29 @@ const VERSION_PENALTIES = [
 ];
 const MATCH_OK = 45;
 
+// Tags that name another edition of the same recording; they only add noise to a YouTube query or a duplicate check
+const EDITION_TAG = /remaster|\bmono\b|\bstereo\b|album version|single version|original mix/i;
+
 const idOf = (uri) => String(uri || '').split(':').pop();
 
 function idFromUrl(url) {
   const m = String(url || '').match(/open\.spotify\.com\/(?:intl-[\w-]+\/)?track\/([A-Za-z0-9]{22})/);
   return m ? m[1] : null;
+}
+
+// "https://open.spotify.com/intl-de/album/<id>?si=..." or "spotify:artist:<id>" -> { type, id }
+function parseLink(text) {
+  const m = String(text || '').trim().match(/^(?:https?:\/\/)?open\.spotify\.com\/(?:intl-[\w-]+\/)?(track|album|artist|playlist)\/([A-Za-z0-9]{22})(?:[/?#]|$)/)
+    || String(text || '').trim().match(/^spotify:(track|album|artist|playlist):([A-Za-z0-9]{22})$/);
+  return m ? { type: m[1], id: m[2] } : null;
+}
+
+// "Bohemian Rhapsody - Remastered 2011" -> "Bohemian Rhapsody"; "Song - Live" stays, it is another recording
+function cleanTitle(s) {
+  return String(s || '')
+    .replace(/\s*[([]([^)\]]*)[)\]]/g, (m, inner) => (EDITION_TAG.test(inner) ? '' : m))
+    .replace(/\s+-\s+(.*)$/, (m, tail) => (EDITION_TAG.test(tail) ? '' : m))
+    .trim() || String(s || '').trim();
 }
 
 function pickImage(sources) {
@@ -131,12 +149,56 @@ function matchScore(sp, c) {
     const d = Math.abs(sp.duration - c.duration);
     dur = d <= 2 ? 25 : d <= 5 ? 18 : d <= 10 ? 8 : d <= 30 ? -5 : -40;
   }
-  const spFull = ` ${key(sp.title)} `, cTitle = ` ${key(c.title)} `;
+  return title * 40 + (artistHit ? 35 : -40) + dur - versionPenalty(sp.title, c.title);
+}
+
+// Cost of the candidate being a live/remix/cover/... version the Spotify track is not
+function versionPenalty(spTitle, cTitle) {
+  const spFull = ` ${key(spTitle)} `, cFull = ` ${key(cTitle)} `;
   let penalty = 0;
   for (const [cost, list] of VERSION_PENALTIES) {
-    penalty += list.map(key).filter((w) => cTitle.includes(` ${w} `) && !spFull.includes(` ${w} `)).length * cost;
+    penalty += list.map(key).filter((w) => cFull.includes(` ${w} `) && !spFull.includes(` ${w} `)).length * cost;
   }
-  return title * 40 + (artistHit ? 35 : -40) + dur - penalty;
+  return penalty;
+}
+
+// One card per recording: the same song from a single, the album and a few compilations shows once,
+// in Spotify's order. Different recordings (live, other length, clean/explicit) stay.
+function dedupeTracks(tracks) {
+  const seen = new Map();
+  return tracks.filter((t) => {
+    const lead = (t.spotifyArtists && t.spotifyArtists[0] && t.spotifyArtists[0].name) || t.artist;
+    const k = `${key(lead)}|${key(cleanTitle(t.title))}|${t.explicit ? 1 : 0}`;
+    const durations = seen.get(k) || [];
+    if (durations.some((d) => Math.abs(d - t.duration) <= 3)) return false;
+    durations.push(t.duration);
+    seen.set(k, durations);
+    return true;
+  });
+}
+
+function mapArtist(a) {
+  if (!a || !String(a.uri || '').startsWith('spotify:artist:') || !a.profile || !a.profile.name) return null;
+  return {
+    id: idOf(a.uri),
+    name: a.profile.name,
+    avatar: pickImage(a.visuals && a.visuals.avatarImage && a.visuals.avatarImage.sources),
+    isVerified: !!a.profile.verified
+  };
+}
+
+// The artist card above the results: an artist who leads the top tracks and whom the query names
+// (exactly, as one of its words, or as a prefix while typing). Spelling-insensitive, so "скрипт" finds
+// Skryptonite. "кино группа крови" -> Kino; "bohemian rhapsody" -> nobody, even though a band has that name.
+function pickTopArtist(q, artists, tracks) {
+  const sq = (s) => key(s).split(' ').filter(Boolean).map(squash).join(' ');
+  const qs = sq(q);
+  if (!qs) return null;
+  const top = new Set(tracks.slice(0, 10).flatMap((t) => (t.spotifyArtists || []).map((a) => a.id)));
+  return artists.find((a) => {
+    const n = sq(a.name);
+    return n && top.has(a.id) && (n === qs || ` ${qs} `.includes(` ${n} `) || (qs.length >= 3 && n.startsWith(qs)));
+  }) || null;
 }
 
 module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs, directYoutubeSearch, logger, dataDir }) {
@@ -219,9 +281,24 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
   }
 
   async function search(q, limit = 20) {
-    const d = await query('searchTracks', { ...SEARCH_VARS, searchTerm: q, limit: Math.min(50, limit) });
+    // Ask for a few more: duplicates are dropped before trimming to the limit
+    const d = await query('searchTracks', { ...SEARCH_VARS, searchTerm: q, limit: Math.min(50, limit + 10) });
     const items = (d.searchV2 && d.searchV2.tracksV2 && d.searchV2.tracksV2.items) || [];
-    return items.map((x) => mapTrack(x && x.item && x.item.data)).filter(Boolean);
+    return dedupeTracks(items.map((x) => mapTrack(x && x.item && x.item.data)).filter(Boolean)).slice(0, limit);
+  }
+
+  async function searchArtists(q, limit = 5) {
+    const d = await query('searchArtists', { ...SEARCH_VARS, searchTerm: q, limit });
+    return ((d.searchV2 && d.searchV2.artists && d.searchV2.artists.items) || []).map((x) => mapArtist(x && x.data)).filter(Boolean);
+  }
+
+  // Tracks plus the artist the query is about; the artist lookup failing never fails the search
+  async function searchAll(q, limit = 20) {
+    const [tracks, artists] = await Promise.all([
+      search(q, limit),
+      searchArtists(q).catch((e) => { log('warn', `artist search failed: ${e.message}`); return []; })
+    ]);
+    return { tracks, artist: pickTopArtist(q, artists, tracks) };
   }
 
   async function searchAlbums(q, limit = 20) {
@@ -279,12 +356,11 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
 
   async function artist({ id, name }) {
     if (!id && name) {
-      const d = await query('searchArtists', { ...SEARCH_VARS, searchTerm: name, limit: 5 });
-      const items = ((d.searchV2 && d.searchV2.artists && d.searchV2.artists.items) || []).map((x) => x.data).filter((x) => x && x.uri);
+      const items = await searchArtists(name);
       const want = norm(name);
-      const hit = items.find((x) => norm(x.profile && x.profile.name) === want) || items[0];
+      const hit = items.find((x) => norm(x.name) === want) || items[0];
       if (!hit) return null;
-      id = idOf(hit.uri);
+      id = hit.id;
     }
     if (!/^[A-Za-z0-9]{22}$/.test(String(id || ''))) return null;
     const [d, releases] = await Promise.all([
@@ -325,10 +401,16 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
   function knownMatch(spId) {
     return matches[spId] || null;
   }
+  // The remembered video is gone (removed, private, blocked); the next resolve searches again
+  function forgetMatch(spId) {
+    if (!matches[spId]) return;
+    delete matches[spId];
+    saveMatches();
+  }
 
-  // meta: { title, artist ("A, B"), duration in seconds }
-  function resolveAudio(spId, meta = {}) {
-    if (matches[spId]) return Promise.resolve(matches[spId]);
+  // meta: { title, artist ("A, B"), duration in seconds }; avoid: video ids known not to play
+  function resolveAudio(spId, meta = {}, avoid = []) {
+    if (matches[spId] && !avoid.includes(matches[spId])) return Promise.resolve(matches[spId]);
     if (resolving.has(spId)) return resolving.get(spId);
     const p = (async () => {
       const sp = {
@@ -337,17 +419,17 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
         duration: Number(meta.duration) || 0
       };
       if (!sp.title) return null;
-      const q = `${sp.artists[0] || ''} ${sp.title}`.trim();
+      const q = `${sp.artists[0] || ''} ${cleanTitle(sp.title)}`.trim();
       let best = null;
       const consider = (c, bias) => {
-        if (!c || !/^[\w-]{11}$/.test(String(c.id || ''))) return;
+        if (!c || !/^[\w-]{11}$/.test(String(c.id || '')) || avoid.includes(c.id)) return;
         const s = matchScore(sp, c) + bias;
-        if (!best || s > best.score) best = { score: s, id: c.id, title: c.title, artist: c.artist };
+        if (!best || s > best.score) best = { score: s, id: c.id, title: c.title, artist: c.artist, penalty: versionPenalty(sp.title, c.title) };
       };
       try {
         parseYtmSongs(await ytmSearchRequest(q)).slice(0, 10).forEach((c) => consider(c, 0));
       } catch (e) { log('warn', `ytmusic lookup failed for "${q}": ${e.message}`); }
-      if (!best || best.score < MATCH_OK) {
+      if (!best || best.score < MATCH_OK || best.penalty) {
         try {
           ((await directYoutubeSearch(`${q} audio`)) || []).slice(0, 10).forEach((c) => consider(c, -5));
         } catch (e) { log('warn', `youtube lookup failed for "${q}": ${e.message}`); }
@@ -356,7 +438,8 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
         log('warn', `no audio match for "${q}"`);
         return null;
       }
-      if (best.score >= MATCH_OK) { matches[spId] = best.id; saveMatches(); }
+      // A live/remix/cover stand-in still plays, but is not remembered: the studio version may turn up next time
+      if (best.score >= MATCH_OK && !best.penalty) { matches[spId] = best.id; saveMatches(); }
       else log('warn', `weak audio match for "${q}": "${best.artist} - ${best.title}" (${Math.round(best.score)})`);
       return best.id;
     })().catch((e) => { log('error', `resolve failed: ${e.message}`); return null; })
@@ -365,8 +448,12 @@ module.exports = function createSpotifyEngine({ ytmSearchRequest, parseYtmSongs,
     return p;
   }
 
-  return { idFromUrl, search, searchAlbums, album, artist, resolveAudio, knownMatch };
+  return { idFromUrl, parseLink, search, searchAll, searchAlbums, album, artist, resolveAudio, knownMatch, forgetMatch };
 };
 
 module.exports.matchScore = matchScore;
 module.exports.mapTrack = mapTrack;
+module.exports.cleanTitle = cleanTitle;
+module.exports.dedupeTracks = dedupeTracks;
+module.exports.pickTopArtist = pickTopArtist;
+module.exports.parseLink = parseLink;
